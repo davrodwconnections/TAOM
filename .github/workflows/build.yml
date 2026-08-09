@@ -97,6 +97,37 @@ jobs:
           fi
           echo "Native DLL links a static CRT — no redistributable dependency."
 
+  python-tests:
+    name: Python Tests
+    # windows-latest, not ubuntu: this suite has only ever been run on Windows, and a first
+    # Linux run belongs in its own change rather than in the one that turns the job on. The
+    # repo is public, so runner minutes are free either way, and the suite takes seconds.
+    # Switching to ubuntu-latest is a one-line change once someone has seen it green there.
+    runs-on: windows-latest
+    # Deliberately NOT gated on vars.BANNERLORD_GAME_DIR. Nothing under tools/tests needs the
+    # game — that gate is what made Build & Test report "skipped" (which does not fail a run)
+    # on every PR, and #421 is about a check that cannot fire being worse than no check.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          # 3.13 is the real floor: four tools call Path.read_text(newline=…), which landed in
+          # 3.13 and raises TypeError on 3.11. See tools/README.md.
+          python-version: '3.13'
+
+      - name: Run the tools test suite
+        # No install step. Every test is stdlib-only, and the nine that want a third-party
+        # package skip themselves when it is absent: five in McpServerTests (mcp) and four in
+        # YaraTests (yara-python). A tenth skips because it wants the game install, which is
+        # the one difference from a developer box.
+        #
+        # Snapshot, not a promise: on 27b0cc8a (2026-08-09), with neither package installed
+        # and BANNERLORD_GAME_DIR unset — what this runner has — that was 464 run, 10 skipped,
+        # 0 failed, exit 0. The counts move as tests are added; nothing here asserts them.
+        run: python -m unittest discover -s tools/tests -p "test_*.py" -v
+
   build:
     name: Build & Test
     runs-on: windows-latest

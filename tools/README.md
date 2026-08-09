@@ -4,6 +4,23 @@ Data generation, rebalancing, and content pipeline scripts.
 
 All Python scripts support `--dry-run` (preview) and `--apply` (write). Run from the repo root.
 
+## Python 3.13
+
+The floor for `tools/` as a whole, and not a preference — four scripts call
+`Path.read_text(newline=…)`, a keyword added in 3.13: `generate_lord_template_equipment.py`,
+`translate_with_claude.py`, and two under `oneoff/`. On 3.11 they raise
+`TypeError: Path.read_text() got an unexpected keyword argument 'newline'`.
+
+The test suite runs on the same floor, and CI pins it there:
+
+```
+python -m unittest discover -s tools/tests -p "test_*.py"
+```
+
+Individual feature docs still quote lower per-tool minimums (3.9+, 3.10+), which may well be
+accurate for the one script each describes — but the collection needs 3.13, so that is what to
+install. See #421.
+
 ## XML I/O convention (MANDATORY for scripts that edit ModuleData XML)
 
 Bannerlord ModuleData XML is UTF-8 (some files with a BOM, e.g. `TAOM_Map/settlements.xml`; most repo files without) and CRLF. To edit byte-faithfully:
