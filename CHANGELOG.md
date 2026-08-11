@@ -4,6 +4,43 @@
 
 ## 2026-08-10
 
+### tools: an item-value skew report, so #318 can be decided on numbers
+
+#318 asks whether LOTRLOME's derived item values (~2.2x vanilla) are intended or should be
+normalized, and says outright that it needs its own analyzer before any apply. `analyze_item_values.py`
+is that analyzer, read-only, reporting to `tools/reports/item-values/`.
+
+Measured against the live trees (2,977 LOTRLOME armor items vs 667 vanilla), the skew is not uniform
+and the shape of it is the useful part:
+
+| type | governing stat | LOTRLOME median | vanilla median | ratio |
+|---|---|---|---|---|
+| HeadArmor | `head_armor` | 33 | 33 | **1.0x** |
+| HandArmor | `arm_armor` | 25 | 18 | 1.39x |
+| BodyArmor | `body_armor` | 35 | 14 | 2.5x |
+| Cape | `body_armor` | 14 | 5 | 2.8x |
+| LegArmor | `leg_armor` | 26 | 5 | **5.2x** |
+
+That reproduces #318's body (2.5x) and leg (worst) figures independently, and adds one it did not
+have: **head armor carries no skew at all**, so a blanket rebaseline would move a curve that is
+already correct. 574 items sit above the highest vanilla item of their type; the report names the
+worst of them.
+
+**What it deliberately does not do** is reimplement `DefaultItemValueModel`. An invented engine
+formula would produce authoritative-looking prices nobody could check, and the decision #318 needs
+rests on the stat curve, which is measurable. Where the real prices matter, `--values-csv id,value`
+folds in values read from a running game; with none supplied the report says so rather than letting a
+stat ratio be misread as a price ratio (pinned by a test).
+
+Parsing is regex rather than ElementTree because several shipped armor files carry fragments a strict
+parse rejects — one bad file must not silence the other few thousand items. The Armory and vanilla
+trees take separate path overrides, since LOTRAOM ships as its own copy of the game and the two can
+live in different installs.
+
+14 new tests. Verified below.
+
+## 2026-08-10
+
 ### chore: v1.4.8 engine bump — nothing in `Main/` had to change
 
 Steam moved the installed game to v1.4.8 (War Sails v1.2.8, build `117131 → 119303`) at 07:22 this
