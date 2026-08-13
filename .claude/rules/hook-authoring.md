@@ -65,6 +65,44 @@ Two correct patterns depending on what the hook checks:
 | Files in the commit's diff (e.g., is CHANGELOG.md staged?) | Compute the **post-amend file set** as `staged ∪ HEAD` and apply the same gate. If CHANGELOG was already in HEAD's diff, it's still in the post-amend commit — the gate correctly allows. |
 | Working-tree state (e.g., is a file gitignored?) | Don't exempt amend at all. Working-tree state is amend-independent — a gitignored file on disk is just as broken in an amended commit as in a fresh one. |
 
+## A detection hook must fail open, but NEVER fail silent (EMPIRICAL: TAOM 2026-08-10)
+
+`harness-facts.md` mandates that a hook's own bug must never block the user. That is about *gating*.
+For a hook whose job is to **detect and warn**, fail-open is only half the contract — because for
+those, **no output is itself a claim**. A drift check that prints nothing is read as "no drift", not
+as "never ran".
+
+The v1.4.7 → v1.4.8 bump proved it. **What is observed:** on 2026-08-10 the hook fired with
+`source=startup` and printed branch, stashes and commits — but no drift banner, with the game on
+v1.4.8 and the pin on v1.4.7. Not a race; the session transcript's birth time was 47 minutes after
+the update finished.
+
+**What is proven about the mechanism:** the pre-fix code had a silent-failure mode. It built its path
+as `"${BANNERLORD_GAME_DIR:-<literal>}/bin/..."`, and the `:-` form substitutes the literal only when
+the variable is **unset or empty** — so a variable that is *set but does not resolve in the hook's
+environment* sails past it, the `-f` test goes false, and the whole block falls through without a
+word. Exporting a bogus `BANNERLORD_GAME_DIR` reproduces total silence in one command.
+`.claude/settings.json` does not define the variable, so the hook inherits whatever the harness
+process carries.
+
+**What is NOT proven:** that this was the actual trigger that morning. The same variable resolves
+fine from an interactive shell, so the hook's environment must have differed in some way that was
+not captured. Treat the mechanism as demonstrated and the specific trigger as undetermined — the
+lesson does not depend on which it was, because a guard with *any* silent-failure mode is the defect.
+
+**When writing or reviewing a detect-and-warn hook:**
+
+| Do | Why |
+|---|---|
+| Probe candidates in order and **always** fall through to the known-good literal | `:-` covers unset/empty, not *wrong*. A set-but-broken value is the common case, not the rare one. |
+| When no candidate resolves, print an explicit **"unchecked, not absent"** line | Silence is indistinguishable from a clean result. Name which inputs were tried. |
+| Ask "what does this hook print when its input is missing?" before shipping | If the answer is "nothing", the hook has no failure signal at all. |
+| Test the broken-input path, not just the happy path | Export a bogus value and run the hook. The 2026-08-10 bug reproduced in one command. |
+
+Still `exit 0`, still never blocks — but loud about not knowing. Applies to `session-start.sh`'s
+drift/stash/worktree checks, `check-doc-config-drift.sh`, `mcp-health-check.sh`, and any future
+hook whose value is the warning it emits.
+
 ## Log-appending hooks: size-cap rotation (EMPIRICAL: TAOM 2026-07-12)
 
 A hook that appends to a `.claude/logs/` file must size-cap-and-rotate it (see `session-stop.sh` /

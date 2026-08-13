@@ -974,3 +974,185 @@ drift does not have to appear in the first row, and a field only a defender or o
 will sail past a single-sample check.
 
 **Source:** review wave on #430, 2026-08-08.
+
+### A decompile stack that skips module-bin assemblies makes an engine diff silently partial, and the loss is one-way (2026-08-10)
+
+The v1.4.7 → v1.4.8 assembly diff read as complete — 8 of 56 changed, each one accounted for — and
+it covered `<GameBin>\Win64_Shipping_{Client,wEditor}` alone, because that is the only place
+`tools/decompile_bannerlord.ps1` walked. `tools/decompile_to_folder.ps1` could not fill the gap
+either: it takes a single mandatory `-Source` bin folder, and its `Modules` category pattern is
+anchored to `^(SandBox|SandBoxCore|StoryMode)\.dll$` — the primary DLL per module. So the 34 vanilla
+assemblies that ship inside a module's own `bin\Win64_Shipping_Client` (`SandBox.View`,
+`SandBox.ViewModelCollection`, `SandBox.GauntletUI`, `TaleWorlds.MountAndBlade.View`,
+`TaleWorlds.MountAndBlade.GauntletUI`, `TaleWorlds.MountAndBlade.Platform.PC`, the
+StoryMode/Multiplayer/NavalDLC satellites, `CustomBattle`, `BirthAndDeath`, `FastMode`, `DOTS`) were
+in no decompile artifact at all — and TAOM patches into several of them (`AgentVisuals`,
+`CharacterTableau`, `MobilePartyVisual`, `SPInventoryVM`, the tournament controllers). Steam
+overwrites the install in place, so **the loss is one-way**: an assembly absent from the stack when
+an update lands has no recoverable baseline afterwards. The v1.4.7 bytes for those 34 are gone.
+
+- **Why missed:** the diff's denominator was the folder the tool already walked, not the set of
+  assemblies the game loads, and every prior bump produced a clean-looking result off the same
+  denominator. Nothing in the pipeline compares its own coverage against the install's DLL
+  inventory, so "56 assemblies diffed" reads identically whether that is all of them or two thirds.
+  Same shape as the prefab-budget lesson above — a green result over the wrong denominator is
+  indistinguishable from a green result.
+- **Prevent:** before trusting an engine diff, enumerate every `bin\Win64_Shipping_Client` the game
+  loads from — the base bin **and** `Modules\*\bin\` — and confirm each DLL landed in an artifact.
+  The baseline has to be captured BEFORE the update, because it cannot be reconstructed after.
+  `decompile_bannerlord.ps1` now carries a `_modules_build` pass over
+  `Modules\*\bin\Win64_Shipping_Client` (125 managed DLLs, written as `<Module>__<Dll>.cs` because
+  names collide across modules), so the next bump is diffable. Recovery for *this* one was partial
+  and accidental: `~/.taom-src/v1.4.7/` had cached 475 per-type decompiles, 42 of them from module
+  DLLs, which diffed 1.4.7-vs-1.4.8 as 42 identical / 0 changed. A per-type lookup cache is an
+  accidental baseline — do not plan to be saved by it twice.
+- **Source:** `docs/migration/v1.4.8-impact.md` ("The decompile stack had a 34-assembly hole").
+
+### A fail-open guard whose failure mode is silence reads as "all clear" — make it fail LOUD (2026-08-10)
+
+`session-start.sh`'s game-version drift check printed nothing on the v1.4.7 → v1.4.8 bump, the exact
+event it exists to catch. Nothing is also what "no drift" looks like. The cause was a shell default
+substitution: `"${BANNERLORD_GAME_DIR:-<literal>}/bin/.../Version.xml"` substitutes the literal only
+when the variable is **unset or empty**, so a variable that was *set but did not resolve in the
+hook's environment* took the `-f` test straight to false and the whole block fell through without a
+word. `.claude/settings.json` defines no `BANNERLORD_GAME_DIR`; the hook inherits whatever the
+harness process happens to carry.
+
+- **Why missed:** the guard was written and verified in the one environment where the variable
+  resolved, and its skipped path and its clean path emit the same thing — nothing. A gate whose pass
+  state is "no output" has no observable difference between working and dead, so no session could
+  have noticed; the drift was found later, by diffing the install.
+- **Prevent:** fail-open is mandatory for TAOM hooks (`.claude/rules/harness-facts.md`), but
+  fail-open must still be fail-LOUD — a guard that can be skipped says it was skipped. The fix tries
+  the env path, then **always** falls back to the known install, and prints `engine drift is
+  UNCHECKED this session, not absent` when neither resolves. When a path comes from an environment
+  variable, build a candidate list with an unconditional fallback rather than `${VAR:-default}`,
+  which defends against unset/empty and never against wrong. Test the guard by handing it a bogus
+  path and confirming it still says something.
+- **Source:** `docs/migration/v1.4.8-impact.md` ("`session-start.sh` — the drift guard failed on the
+  event it exists for"); `.claude/hooks/session-start.sh`.
+
+### For a native-only changelog item, audit the DATA feeding the native path — not the C# calling it (2026-08-10)
+
+v1.4.8's "Fixed horse rein visual bug when a mounted agent died" was first ruled **Unaffected** off a
+C#-only grep: TAOM has no Harmony patch on agent death, ragdoll or reins. Wrong question. The fix is
+native with no managed diff anywhere, so no grep of `Main/` could return a hit — a zero-hit grep was
+guaranteed before it ran. TAOM's exposure is in Monster DATA. Measured against the live install:
+native `horse` / `camel` / `mule` each declare the full set of 12 `rein_*` attributes and are
+rideable; native `horse_2` / `camel_unmountable` / `mule_unmountable` declare none and are not
+rideable. `taom_war_elephant` and `taom_mumakil` declare **zero rein attributes and are rideable**
+(`LOTRLOME_Armory/ModuleData/Monsters/LOTR/lotr_monster_{elephant,mumakil}.xml`), `Monster.spider`
+declares a partial set, `chariot` the full 12. In vanilla, "rideable" and "declares a full rein set"
+are the same set; TAOM breaks that pairing. Rideability is declared, not inferred —
+`LOTRLOME_items/LOTRAOM_horses.xml` carries `<Horse monster="…">` for `Monster.chariot`,
+`Monster.spider`, `Monster.taom_mumakil`, `Monster.taom_war_elephant` — and
+`tools/audit_mount_parity.py` contains **zero** occurrences of `rein`, so nothing gates it. This is
+an UNVERIFIED risk awaiting an in-game test, not a confirmed defect.
+
+- **Why missed:** "does TAOM patch this?" is the reflex question at a bump and the right one for a
+  managed change. For a native fix it is unanswerable by construction: the absence of a managed
+  surface guarantees the empty result, which then reads as evidence of safety instead of evidence
+  that the wrong instrument was used.
+- **Prevent:** classify each changelog line as managed or native FIRST. For a native one, ask what
+  data TAOM feeds into that subsystem and compare its shape against vanilla's — a total conversion
+  is usually the only caller producing the unusual input. Where the comparison finds a gap, the
+  subsystem's parity auditor gets the check (`audit_mount_parity.py` covers usage actions and gait
+  clips; rein attributes are in neither). The live monster files sit in unversioned dependency
+  modules (`LOTRLOME_Armory`, `Alliance.Wargs`), so per the CLAUDE.md trap any fix there ships with
+  a repo-side validator gate beside it, or a module reinstall silently reverts it.
+- **Source:** `docs/migration/v1.4.8-impact.md` (changelog row N7 — rein / ragdoll).
+
+
+### Batch verification; a suite you already ran is not new evidence
+
+`evidence-over-claims.md` requires fresh verification before a completion claim. It does NOT require
+verification after every edit, and reading it that way is how a session spends most of its wall-clock
+waiting on its own test runs.
+
+- **Why it happens:** each individual re-run feels like diligence, so there is no single moment at
+  which the cost becomes visible. The 2026-08-11 enlistment session ran the full 6,380-test suite
+  roughly fifteen times across seven fixes. The marginal runs proved nothing that a batched run at
+  each item's completion would not have, and the user noticed the latency before the session did.
+- **Prevent, a rate that keeps the guarantee intact:**
+  - **Compile** after each edit. Fast, and it catches the error that actually happens most.
+  - **Filtered suite** (`--filter FullyQualifiedName~XxxTests`) while iterating on one component.
+  - **Full suite** at each work-item boundary and once before the review gate. That is the run whose
+    result you quote, and it is the only one the rule ever asked for.
+- **Same discipline for engine lookups:** batch `ilspycmd` / `taom-src` calls for related types into
+  one command instead of one round trip per type.
+- **Source:** 2026-08-11 enlistment field-fix session, user-reported.
+
+### Use Edit for edits; reach for a script only for genuine fan-out
+
+A throwaway Python or sed script to change one constructor or one comment is slower than the Edit
+tool, not faster. It fails on assumptions you cannot see until it runs, and a failed script leaves you
+re-reading the file to work out what state it is now in.
+
+- **Why it happens:** batching several edits into one script LOOKS like the efficient move, and for
+  genuine fan-out (the same mechanical change across 12 language files, or 8 test constructors) it is.
+  For one or two edits it inverts: the script needs anchors that must match exactly, and a mismatched
+  anchor costs a full read-diagnose-rewrite cycle.
+- **Concrete failures, one session:** a constructor extraction took **three attempts** (wrong method
+  ordering, then a regex that did not match the ctor signature); a `sed` meant to rename a parameter
+  also mangled the doc comment above it and needed a manual repair; and a heredoc broke on an
+  apostrophe inside the payload.
+- **Prevent:** Edit for 1-3 sites. Script only when the same change lands in 4+ files, and when it
+  does, make every anchor an `assert` so it fails loudly and atomically **before** the write rather
+  than half-applying. Write the script to the scratchpad with the Write tool and execute the file,
+  rather than piping a heredoc through the shell, which turns every apostrophe and backtick in the
+  payload into a quoting hazard. Never chain a backup through `/tmp` on Windows: the Read tool cannot
+  see git-bash `/tmp` paths, so a failed restore is invisible.
+- **Source:** 2026-08-11 enlistment field-fix session.
+
+### Do not refactor during a review gate
+
+A cleanup that is not fixing a reported defect does not belong between "changeset complete" and
+"changeset committed". It churns the exact files the review agents are reading, invalidating their
+results, and it delays the finding that would actually change the code.
+
+- **Why it happens:** a review flags a code-quality issue, and fixing it immediately feels like
+  responsiveness. The tell is writing the words *this is polish, not a fix* and then doing it anyway,
+  which happened verbatim on 2026-08-11.
+- **Prevent:** while a review is outstanding, act only on findings that change runtime behaviour.
+  Queue quality findings and address them after the gate closes, or in a follow-up commit. The one
+  exception is a violation your own changeset introduced or deepened, which is yours to fix, and even
+  then hold the edit until the agents reading that file have reported.
+- **Source:** 2026-08-11 enlistment field-fix session.
+
+### A diagnostics change justified on volume must carry the measurement, in the comment
+
+"This line is noisy" is not a reason to downgrade or delete it. The count is the reason, and if the
+count cannot be produced the change does not go in. TAOM's `FileLogger` writes INFO synchronously
+and leaves DEBUG on an async queue that a hard native CTD discards, so every INFO-to-DEBUG move
+spends real crash-forensic value; the price is only worth paying against a measured volume.
+
+- **Why missed:** `ServiceBattleService`'s join-refusal line was moved to DEBUG under a code comment
+  asserting it "lands after every single fight." The field log that motivated the whole session was
+  open at the time and says 3 occurrences across 5 joins in 39 minutes. Nobody checked, because the
+  frequency was incidental to the change rather than its subject. The deep-review efficiency agent
+  caught it only because its prompt carries a standing order to read `FileLogger.cs` before costing
+  any logging change, a rule added after the 2026-08-03 battle-load incident.
+- **Prevent:** put the measurement inline, with its source: "3 lines across 5 joins in 39 minutes,
+  `taom_debug_2026-08-12_12-50-32.log`". A comment that states a frequency reads as settled fact to
+  the next person in the file, so an unmeasured one is worse than no comment. Note the surface:
+  `evidence-over-claims.md` §C lists "doc / CHANGELOG / commit message" and does not name code
+  comments, which is exactly where this one landed.
+- **Source:** `docs/reviews/rca-enlistment-diagnostics-legibility-2026-08-12.md` finding #1.
+
+### Confirm a negative by exhaustion, not by sampling
+
+"I read the file and found no other assignment" and "no other assignment exists" are different
+claims, and only the second justifies writing an engine invariant into a shipped comment.
+
+- **Why missed:** the claim that `MapEventSide.LeaderParty` is assigned in exactly two places went
+  into a code comment and the CHANGELOG after one file was read. It happened to be true. The
+  compatibility agent established it properly: decompile the whole assembly as a project with
+  `ilspycmd -p`, grep every file for the assignment, then check the setter's accessibility and the
+  absence of `InternalsVisibleTo` to prove no other assembly can reach it either.
+- **Prevent:** for any "this is the only place X happens" claim about engine internals, decompile
+  the whole assembly and grep it, and close the loop on accessibility. It costs one command more
+  than reading a single file. Relatedly, a subagent's decompile finding that is about to become a
+  durable repo artifact needs the same first-hand verification as one relayed to the user;
+  `evidence-over-claims.md` §A.4 reads as though it governs only the latter.
+- **Source:** `docs/reviews/rca-enlistment-diagnostics-legibility-2026-08-12.md` findings #4 and the
+  Agent 2 note.

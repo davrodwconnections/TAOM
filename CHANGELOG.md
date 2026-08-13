@@ -2,6 +2,833 @@
 
 > **Archive:** entries before 2026-07-01 live in [`docs/changelog-archive/CHANGELOG-2026-H1.md`](docs/changelog-archive/CHANGELOG-2026-H1.md) (rolled 2026-07-12; cadence: each Jan 1 / Jul 1 — keep the current half-year here, roll the rest).
 
+## 2026-08-12
+
+### fix(enlistment): three log lines said things they did not mean
+
+A live field session (39 minutes, Recruit through Soldier, oath to promotion) produced zero errors
+and zero exceptions, so this is a legibility pass on the diagnostics, not a behaviour fix. What it
+did produce was three lines that get read wrong, twice by their own author in one sitting.
+
+**The duty result quoted a comparison it was not making.** The old line, verbatim:
+
+```
+[Enlistment.Duties] duty 'scout_route' completed — skill 12 trust 1 rank Soldier vs difficulty 56
+```
+
+That parses as a contradiction: 12 is nowhere near 56, yet the duty passed. The check is `skill + trustBonus + rankBonus + roll(0..50) >= difficulty`, so the line
+was setting one term of a four term sum against the target and dropping the rest, including the
+roll that does most of the work. It now prints the deterministic half with its breakdown and the
+roll range: `check 16 (skill 12, trust +0, rank Soldier +4) + roll 0-50 vs difficulty 56`.
+
+That format is what exposed the problem sitting behind it, and the problem is not where it first
+looked. `FieldDutyReachabilityTests` already pins the floor "every row must be winnable by the
+weakest player its own gates admit", and every row passes it. The floor rests on one assumed
+constant, `UntrainedSkill = 10`, described in the test as roughly a fresh hero's untrained value.
+The field log falsifies the assumption rather than the rows: the gating skill was 0, because a
+Bannerlord hero has 0 in anything they never invested in and Charm on an orc warrior is the ordinary
+case. Recompute at skill 0 and eight of the thirteen rows become impossible rather than hard, from
+`road_patrol` (52, needs 2) up to `deserter_sweep` (64 at Soldier, needs 10). The three
+Veteran-gated rows are unaffected, since `minTrust` 8 to 15 carries them past their difficulty even
+at skill 0, which is the earlier `hideout_strike` fix still holding. Nothing is retuned here:
+whether the constant moves and which rows follow is #438's call. Recorded in the feature doc.
+
+**It also printed a trust that had decided nothing.** `record.Trust` was read after `Grant` applied
+the outcome's trust delta, so a failure costing 1 trust reported `trust -1` for a check that had run
+on trust 0. Every check input is now snapshotted before the reward.
+
+**A working guard read as a #443 sighting.** The old line, verbatim:
+
+```
+[Enlistment] battle command stripped at AfterStart — enlisted soldier, side led by 'lord_G5_2_party_1' (#424)
+```
+
+It names a lord who is not the player's commander, which looks like wrong-team placement. `MapEvent.GetLeaderParty` returns `MapEventSide.LeaderParty`, which
+the engine sets to whichever party opened that side and only reassigns if that party leaves, so an
+allied lord there is ordinary. The line now says "player's side opened by" and names what the id is.
+The actual #443 signal, `ServiceBattleService`'s "army merge unavailable", was absent across all
+five joins in the session.
+
+`commander battle (...) ignored — state is EnlistedBattle` was briefly dropped to DEBUG and is back
+at INFO, with the reasoning now written down so it does not get downgraded again. The downgrade
+rested on a comment asserting the line "lands after every fight"; the field log says 3 occurrences
+across 5 joins in 39 minutes, and nobody had checked. DEBUG is `FileLogger`'s async queue, which a
+hard native CTD discards, and this is the only line recording that a join was refused and which
+trigger asked, which is the evidence #408 turns on. Three synchronous writes an hour is not a cost
+worth that.
+
+`IEnlistmentDiagnosticsSettingsProvider`'s doc still claimed the gate was "ON by default" and
+resolved a missing setting with `?? true`. It has been `?? false` since 2026-08-09. The doc now also
+names the five statements the gate actually covers, because most `[EnlistDiag]` lines are ungated
+and an absent one proves nothing about the toggle either way.
+
+`SkillCheckService` gained its first test file. The formula every duty and camp option resolves on
+had no direct coverage: its only apparent tests came through `FieldDutyRuntimeTests`, which mocks
+`ISkillCheckService`, so no test in the suite ever executed a line of it. The refactor that split
+out `EffectiveSkill` and `TrustBonus` could have inverted a `Math.Max` and stayed green across all
+6,444 tests. Twelve tests now pin the two statics, the assembled check, the inclusive `>=` boundary,
+and the property that a maximum roll cannot close a gap of 51.
+
+Found by the review, not by the author: `docs/reviews/rca-enlistment-diagnostics-legibility-2026-08-12.md`.
+
+Not-tested: the strings as they appear under a live campaign (asserted at the service layer).
+
+### fix(diagnostics): the #371 build-pair warning cried wolf on a docs commit
+
+`BuildStampReport` flagged any two module build stamps more than an hour apart as a hard
+`MISMATCH`, telling the reader the modules were not built together. The 2026-08-12 session tripped
+it at 2h37m, because TAOM was
+rebuilt after two docs commits and TAOM.Dependencies was not. `git diff --name-only 9c532b5e..HEAD`
+touched only CHANGELOG.md, CLAUDE.md, `docs/` and `.claude/rules/`, so no code differed at all.
+
+The runtime cannot answer the question that actually matters (did any code change between these two
+commits?) because that needs git, and the game has no repo. Elapsed time is the only proxy
+available, so the verdict is now tiered on the shape each case really has: within an hour is a
+paired build, up to twelve hours is an incremental rebuild and says so plainly, and past that keeps
+the loud MISMATCH. The stale module #371 was opened for was two weeks old, not two hours. A warning
+that fires on a docs commit is one the reader learns to skip, which protects nothing.
+
+`Mismatched` is an explicit switch case rather than the `default` branch, so a future fourth tier
+cannot inherit the loudest wording by falling through. `IsMismatched` is gone: rewiring `BuildReport`
+onto `Classify` left it with no production caller, and it had survived only because three tests
+still referenced it. Those cases are covered by the `Classify` tests, so the method and its tests
+went together.
+
+### fix(cultures): nine kingdoms were fielding Calradian troops
+
+Reported as "settlement patrols are vanilla troops, not kingdom troops". Patrols were the visible
+half. The cause runs through every party the engine builds from a culture.
+
+`DefaultSettlementPatrolModel.GetPartyTemplateForPatrolParty` reads
+`settlement.OwnerClan.Culture.SettlementPatrolPartyTemplate{Weak,Moderate,Strong}`, which
+`CultureObject.Deserialize` fills from the `settlement_patrol_template_level_1/2/3` XML attributes.
+Nine town-owning cultures resolved those to vanilla templates, so Imperial infantrymen patrolled
+Dunland and Vlandian crossbowmen patrolled Rohan. The same gap ran through their villager, militia,
+rebel and caravan bindings.
+
+Two different mechanisms put it there. **Dunland, Harad, Rohan and Rhun never named the patrol
+attributes at all**: each `Culture[@id='X']` block in `spcultures.xslt` opens with
+`<xsl:apply-templates select="@*"/>`, which copies every vanilla attribute in, so an attribute the
+block does not mention keeps its Calradian binding with nothing in the file to show for it.
+**Khand, Umbar, Shaghana and Abanissa were bound to vanilla explicitly**, as placeholders that were
+never revisited. Dale was the only retagged culture wired correctly.
+
+The fix was mostly wiring, not authoring. `patrol_party_{rohan,dunland,harad,rhun}_template_level_1..3`
+already existed with the right lore troops and were referenced by nothing, along with the matching
+villager, militia, rebel and caravan templates. Three genuinely missing templates were written:
+`villager_dale_template`, `caravan_template_dale`, `elite_caravan_template_dale`. Khand shares Rhun's
+(no `khand_*` troop or template exists, and its own block already used Rhun's militia troops), and
+the three southern cultures share Harad's. Umbar's `basic_troop` and four militia troops were also
+literal `aserai_*` ids and are now Harad's, matching Shaghana and Abanissa.
+
+Caravans needed two edits per block rather than one. `CultureObject.Deserialize` reads them only
+from the plural child elements, never from the `caravan_party_template` attribute that four blocks
+carried as dead markup, and it **appends** every matching child into one list instead of replacing.
+Emitting a TAOM caravan block without also excluding vanilla's from the passthrough filter would
+have left each culture holding both and rolling Calradian roughly half the time, which is worse than
+the original bug because it is nondeterministic.
+
+Two of these bindings are crash surfaces, not just wrong troops:
+`PatrolPartiesCampaignBehavior.SpawnPatrolParty` dereferences `partyTemplate.ShipHulls` and
+`CaravansCampaignBehavior.SpawnCaravan` calls `GetRandomElementWithPredicate` on the caravan list,
+neither with a guard. So the new gate asserts presence and non-emptiness, not merely that a binding
+is non-vanilla.
+
+`TAOM.Tests/Core/CulturePartyTemplateTests.cs` runs `spcultures.xslt` over a synthetic vanilla
+document whose every binding is a unique sentinel, then fails on three states: attribute absent,
+sentinel survived (unbound, so the passthrough would supply Calradia), or bound to an id
+`taom_partyTemplates.xml` does not define. Both halves are needed, and Khand is the case that proves
+it: it named every attribute and was still wrong. The id check is a whitelist rather than a blacklist
+of vanilla prefixes, because TAOM redefines no vanilla party-template id, so "not TAOM-authored" is
+exactly "resolves to Calradian troops" with no exemption needed for the intentional cross-culture
+sharing.
+
+This is the fourth time the XSLT passthrough has silently inherited a vanilla binding (Dale, Rohan,
+Khand, now this). The third instance recorded the Rhun and Khuzait party templates as a known gap in
+a code comment and called re-theming them separate content work. It stayed separate for eight days.
+Writing a gap into a comment is not a plan to fix it, and the lesson entry now says so.
+
+Existing saves pick up the new bindings for newly spawned parties, since cultures re-deserialize on
+every load. Patrols already on the map keep their vanilla rosters until they are destroyed and
+respawn, which was the accepted trade for keeping this a pure data change.
+
+Not in scope, split out with the evidence: NavalDLC's coastal patrol and fishing templates (the
+reader is unreachable, no TAOM settlement declares a `port_posX` pair), and roughly 40 vanilla
+`*_aserai` NPC role bindings on Umbar whose child and teenager ids have no Harad counterpart.
+
+Verified: `dotnet test TAOM.Tests` 6435 passed / 0 failed, `python tools/validate_moduledata.py`
+PASS, and the stylesheet transformed against installed `SandBoxCore/spcultures.xml` to confirm all
+eight attributes bind, exactly one caravan wrapper survives per culture, and no child element the
+new filter entries could have caught was dropped.
+
+**Documentation swept for what this falsified, not just what it added.** A four-surface audit
+(registries, culture prose, `.claude/` rules and skills, and a repo-wide stale-string hunt) turned up
+20 files. The ones that mattered were not the missing index rows, they were the docs actively
+teaching the bug:
+
+- `docs/ai-includes/new-culture-authoring.md` listed `villager_party_template` and both caravan child
+  lists under "inherit vanilla". That table is a large part of why this recurred; those three rows
+  moved to bind-required, and the template count went 9 to 12.
+- `docs/features/kingdom-creation.md` gave a caravan snippet using `<CaravanPartyTemplate template="..."/>`.
+  The deserializer reads the `id` attribute off whatever child it finds, so `template=` appends a
+  **null** to the caravan list, and `SpawnCaravan` dereferences it unguarded. Following that doc
+  literally crashed the campaign on the first caravan. Its required-attributes table also recommended
+  vanilla Calradian ids throughout, two of which (`villagers_aserai_template`,
+  `vassal_reward_aserai_template`) are not ids that exist.
+- `tools/generate_xslt.py` is documented as a live generator whose output is `spcultures.xslt`.
+  Running it would have reverted this entire change. Marked retired: its output path is hardcoded to
+  a repo that no longer exists (`c:/Users/mikew/source/repos/TAOM`) and its input to a LOTRAOM asset
+  dump.
+- `docs/reviews/rca-dale-2026-05-26.md` recorded three PASSTHROUGH verdicts ("fine for Dale", "not
+  Dale-specific") that were wrong and were followed for over two months. The RCA keeps its original
+  table as the historical record with a correction appended, because the useful lesson is about the
+  form of the verdict: a PASSTHROUGH decision needs the vanilla value named and a reason, and two of
+  those three named a template that did not exist under that name.
+- `docs/cultures.md` said 10 native cultures (there are 24) and mapped `battania` to Dunland (it is
+  Khand). It now also carries the shares-another-culture's-templates mapping, which was load-bearing
+  and lived only in the data.
+
+Prevention moved to where an agent actually hits it rather than staying in a lessons file:
+`.claude/rules/xslt.md` (fires on every `.xslt` edit) gained the inheritance direction of the
+passthrough hazard and the child-elements-union rule; `.claude/rules/vanilla-data-comparison.md`
+gained a row and a section; `/xslt-check` gained a transform-and-diff step, since it reported clean on
+all four instances by reading markup that never contained the defect; `.claude/rules/tests.md` and
+`docs/ai-includes/testing-guide.md` record the sentinel-stub technique and the shipped-data test
+category it belongs to.
+
+The two deferred items now live somewhere a future session will find them: the NavalDLC coastal and
+fishing templates in `docs/features/naval-travel.md` Known Limitations (with the finding that ports,
+ship hulls and the two templates are one work item, not three), and the Umbar NPC role bindings in
+`docs/features/kingdom-creation.md` and `docs/cultures.md`.
+
+Not-tested: in-game patrol, caravan, villager, militia and rebel spawns.
+Research: DefaultSettlementPatrolModel, PatrolPartiesCampaignBehavior, PatrolPartyComponent,
+CultureObject.Deserialize, CaravansCampaignBehavior.SpawnCaravan, NavalDLC's NavalSettlementPatrolModel.
+Save-compat: XML-only, cultures re-deserialize on load. Live parties keep their existing rosters.
+
+### fix(enlistment): the review pass on the field-test fixes, including a crash
+
+Six findings from the deep review of the changeset below. One of them was a crash the first pass had
+looked straight at and cleared.
+
+**The army we raise for a battle must never outlive it.** The transient merge builds an `Army` with
+the bare constructor to avoid `Gather()`'s side effects, which leaves `AiBehaviorObject` null for the
+object's whole life. The first pass verified that this keeps the army's siege and owner-change
+handlers *inert* (they all gate on `AiBehaviorObject is Settlement`) and stopped there, writing
+"stays inert" into the doc comment. It audited what the null value fails to **do** and never asked
+what **reads** it. Verified on installed 1.4.8:
+`Army.GetLongTermBehaviorTextForAILeadedParty` casts and dereferences that field with **no null guard
+in five of its seven cases** (`GoToSettlement` → `AiBehaviorObject.Name`, `BesiegeSettlement` →
+`settlement.IsVillage`, `RaidSettlement`, `DefendSettlement` → `settlement.Position`,
+`PatrolAroundPoint`); only `Hold` and `GoToPoint` are guarded, because vanilla only ever arrives here
+after `Gather()` has seeded the field. Two live callers reach it. `MobileParty.GetBehaviorText()`
+draws the map party tooltip, and takes that path because the commander's party *is* the army leader,
+so its `Army.LeaderParty == this` arm applies. `KingdomArmyItemVM` draws the kingdom Armies tab.
+
+Nor would such an army clean itself up: `Army.CheckInactivity` **decrements** the inactivity counter
+for a leader who is besieging, raiding or defending, so one raised around a lord who then goes
+besieging never times out, and `_aiBehaviorObject` is `[SaveableField(16)]`, so the null survives
+every reload. The previous code deliberately left the army standing whenever another lord had joined
+it, on the reasoning that it had become a real army. It had not. It is now disbanded
+unconditionally. `DisbandArmyAction.ApplyByObjectiveFinished` is an ordinary vanilla dispersion, so
+any lord who joined is detached, repositioned and resumes his own business on the next AI tick.
+
+**Three more places the army could be left attached or stale.** The reconciler's stale-battle
+self-heal (the only code that notices a battle resolved without a `MapEventEnded` edge) flipped the
+state back to attached but had no way to leave the army, silently re-creating the post-defeat
+forfeiture that report 7b fixed, on the next unrelated ambush. It now leaves. And
+`ServiceMaintenanceService.ResetSessionCaches` now drops the army adapter's handle alongside every
+other per-session cache: that handle is a live `Army` reference on a singleton whose container
+outlives the campaign, so after a reload it names a dead object and the identity test in `LeaveArmy`
+could never match again.
+
+**`MeritBand.Renown` was dead config.** No default band set it and no shipped JSON key existed, so
+`bandRenown` was 0 on every path and every battle paid the identical flat base, while
+`BattleRenownPolicy`'s own doc comment claimed "the band figure does the differentiating." Six tests
+covered that policy exhaustively and every one of them passed `bandRenown` in as a literal, so the
+function was fully tested and completely disconnected from the values that reached it. The four bands
+now pay 3/2/1/0, `renown` and `battleWinRenown`/`battleLossRenown` are exposed in
+`enlistment_config.json`, `Renown` joined `IsValidBandLadder`'s non-negative set (it is directional,
+a negative band would eat the base and make a good fight pay less than a bad one), and a test now
+reads the shipped file rather than the defaults.
+
+**Two gates that named the same condition differently.** `GetDailyWage()` (the wallet projection)
+gated on `IsEnlisted`, which spans five states, while `EnlistmentDailyService.RunDailyTick` skips
+`PayDailyWage` in one of them (`CommanderUnavailable`, where there is no chain of command left to pay
+anyone). The tooltip promised income on exactly the days none arrived, for a grace window up to a
+week, and that tooltip is the one surface a player checks when they suspect they are not being paid.
+Separately, `TaomClanFinanceModel` overrode `CalculateClanGoldChange` but not `CalculateClanIncome`,
+which calls `CalculateClanIncomeInternal` directly and never routes through it, so the clan screen's
+Income tile showed no wage while the expected-change tooltip beside it did. Both overrides now share
+one `AddServiceWageLine`; the withdrawal guard is kept on both even though `CalculateClanIncome` has
+no money-moving caller.
+
+**Two more exits found by the Codex pass, after ten agent-passes had cleared the area.** Every Claude
+agent enumerated the paths that end a BATTLE, because that is the vocabulary this work is written in.
+Codex opened `DischargeService` (a file the changeset never touched) and asked what happens when
+SERVICE ends instead. It calls `ClearArmyAttachment()`, which detaches the player but knows nothing
+about the army, and discharge fires mid-battle whenever the MCM master switch is turned off or
+`CommanderDead` is raised from `EnlistedBattle`. It now leaves the army first, with an ordering test
+and a per-`DischargeReason` loop test.
+
+The second half is sharper: `EnlistmentRecord.ToPersistedState` **coerces `EnlistedBattle` to
+`EnlistedAttached`** on save, so a save taken mid-battle reloads with the player still merged into
+the army and a state the reconciler's `EnlistedBattle`-keyed self-heal is structurally blind to. That
+guard is now keyed on the observable world (no map event anywhere, and the player actually in an
+army) rather than on a persisted state whose own serializer rewrites it.
+
+**Three more unguarded readers, and the one that changed the fix.** Re-running the API-compatibility
+pass found that the first sweep had stopped at the boundary of the class declaring the field. Two
+more readers live elsewhere, and one of them is far worse than anything in `Army` itself:
+`LordConversationsCampaignBehavior.conversation_lord_tell_objective_gathering_on_condition` reads
+`Army.AiBehaviorObject.Name` gated ONLY on `Army != null && Army.IsWaitingForArmyMembers()`, no
+`ArmyType` check, unlike its three sibling conditions, and `IsWaitingForArmyMembers()` returns
+**true forever** for an army built without `Gather()`, because `_armyGatheringStartTime` stays 0 and
+the only thing that sets it itself requires `AiBehaviorObject is Settlement`. So a stray army made
+*talking to your commander* an unconditional crash, which is the first thing a player does after
+reloading, and it is an option on this feature's own wait menu. Also found:
+`MobileParty.CheckAiForMapChangeAndUpdateIfNeeded` branches on that field being null and then
+dereferences it on the same branch, and `SetPartyAiAction`'s `PatrolAroundPoint` case sets
+`DefaultBehavior` *without* writing the objective, so that text case is reachable with a genuinely
+unset one.
+
+The field is therefore now **seeded** at construction, to the commander's current or home
+settlement, in addition to the unconditional disband. That makes the invariant a property of the
+object rather than of anyone's ability to enumerate every exit path. It is inert for the army's real
+lifetime: the only two behaviours the objective drives both require `LeaderParty.MapEvent == null`,
+and the army exists only while the commander is in a map event; they can fire solely for an army
+that leaked, where being walked toward a settlement beats a crash. This also retires the known
+limitation recorded above: a mid-battle save can still strand a one-lord army, but it is now merely
+untidy. (Relatedly: `ArmyTypes.Patrolling` turns out to be load-bearing rather than cosmetic;
+`IsAnotherEnemyBesiegingTarget` only avoids the same null because `ArmyType == Besieger`
+short-circuits first.) The full guarded/unguarded reader list is now in the feature doc so no future
+session re-derives it.
+
+**The war mirror could declare as one faction and make peace as another.** `Hero.MapFaction` is
+`Clan.Kingdom ?? Clan` and the enlist gate deliberately admits a player whose clan is already a
+vassal, so the identity is not stable for the length of a term. A player independent at oath declared
+as his own clan; if that clan joined a kingdom before discharge, the unwind resolved `MapFaction`
+live and would have called `MakePeaceAction.Apply` on the **kingdom**, ending a war for every vassal
+in it because one soldier left service. `EnlistmentRecord.OathFactionId` now pins the declaring
+identity, and the unwind refuses to act under a different one, clearing the mirror without touching
+anyone's diplomacy. A save from before the pin unwinds as previous builds did, so nobody mid-service
+is stranded.
+
+**The commander-loss modal fired once per commander per process.** `_lossAnnouncedFor` stops the
+"Word from the column" inquiry repeating every hour within one grace episode, but was never cleared
+when the commander recovered, so a lord captured, ransomed, then broken again took the player into a
+second grace in total silence. Re-armed on recovery.
+
+RCA, with a "why missed" for every finding and seven lessons:
+[`docs/reviews/rca-enlistment-field-fixes-2026-08-11.md`](docs/reviews/rca-enlistment-field-fixes-2026-08-11.md).
+
+Suite **6413 passed / 0 failed / 2 skipped** (6311 baseline for the branch, +102).
+`validate_moduledata` PASS, `lint_docs` clean.
+
+Save-compat: one new persisted field, `oathFactionId`. Additive, a save without it parses to null,
+which `UnwindServiceWars` reads as "no pin recorded" and handles as previous builds did.
+
+Not-tested: the army merge, the seed and the disband still need a live campaign, because
+`ArmyMembershipAdapter` touches `MobileParty.MainParty` and constructs a real `Army`. Pinned instead
+by `ArmyMembershipBindingTests`, which asserts both the engine surface it depends on and the engine
+defects it works around, so an engine bump that adds the missing null guards tells us the workaround
+can relax. **In-game verification owed** on: raising an army for a battle, letting a real lord join
+it, ending the battle, then opening the kingdom Armies tab, hovering the commander's party, and
+talking to him. All three were crash surfaces.
+
+## 2026-08-11
+
+### docs(style): produced prose no longer uses em or en dashes
+
+The rule said the opposite until today. `.claude/rules/output-style.md` carried a house-style
+carve-out declaring the long dashes deliberate semantic markers to keep, and
+`.claude/skills/humanizer/SKILL.md` repeated that in six places, including the pattern table, the
+audit pass and the "what NOT to flag" list. Both now say the opposite, on a standing instruction
+from the user: the point of the style rule is that produced work should not read as machine-written,
+and the long dashes are what gives it away first.
+
+Three boundaries, all deliberate. Hyphens stay legal, so `--RunTests`, `v1.4.8` and every kebab-case
+filename are untouched. The ban covers produced artifacts only (commit bodies, CHANGELOG entries,
+issues, PRs, docs, RCAs), not chat replies. And it applies to new writing only: 40,476 dashes already
+sit in the tree (CHANGELOG 1,604, `docs/` 37,448 across 637 files, `.claude/` 1,424 across 73), a
+count the old carve-out put at "~4,340", so it was wrong by a factor of ten as well as being
+reversed. Rewriting 711 files would risk mangling tables for no reader benefit.
+
+Enforcement is `check_ai_dashes` in `tools/lint_docs.py`. It reads git rather than the tree: added
+lines since a base ref (`--dash-base`, default `HEAD`) plus untracked markdown in full, which is what
+keeps the report at zero on a clean checkout instead of drowning in the 40,476. Fenced blocks, inline
+code spans, URLs, link targets and an explicit `<!-- lint-allow-dash -->` marker are exempt, the last
+one for text quoted verbatim from outside TAOM, where a rewrite would falsify the quote. The check is
+**report-only** and deliberately absent from the `--fail-on-drift` set that
+`.claude/hooks/check-doc-config-drift.sh` uses to block commits, since a false positive there would
+stop work over punctuation. Commit message bodies are governed by the rule but invisible to the
+linter, which only sees markdown files.
+
+21 new tests in `tools/tests/test_lint_docs.py` cover the scanner (fence tracking across both fence
+styles, code spans, link targets, the hyphen guard, one finding per line) and the git scope, the last
+including the case that matters most: a committed file full of dashes plus one new line reports
+exactly one finding.
+
+Not-tested: nothing in the game. Documentation and tooling only.
+Rejected: a blocking pre-commit hook, and a full 40,476-instance sweep. Both were offered; the user
+took the lint check and the new-writing-only scope.
+
+### fix(careers): a Gundabad career was offered, selectable, and granted nothing
+
+The Cave Troll Master career screen drew its three tier labels and then stopped — no perks, and an
+ability slot reading `cave_troll_master_ability` where a name should be. The data was never missing.
+Its perk tree and its ability template were commented out behind a `DISABLED 2026-05-14 ... not
+ready for live game yet` marker while the `<Career>` element itself stayed live, so character
+creation kept offering a career the registry could not resolve.
+
+Nothing complained, because nothing is built to. `CareerRegistry.GetGroup` returns null for an
+unknown group and `GetChoicesForGroup` returns `EmptyChoices`, neither with a log line — an empty
+screen is indistinguishable from a career that legitimately has no perks yet.
+
+The reason for the park had also expired. `insert_new_faction_careers.py` cloned this exact tree
+into `goblin_troll_driver`, `misty_troll_goad` and `craig_pit_driver`, all three of which ship live
+and all three of which point at the same `cave_troll_master_particle`, `cave_troll_master_activate`
+and `ability_cave_troll_master_icon` assets. The tree players were being protected from was already
+in their game three times over.
+
+An audit of the other 60 careers found no second instance: every one resolves six groups of five
+choices with exactly one keystone each, valid tiers, no duplicate or orphan ids, and a matching
+`career_menu.json` row. All 23 `PassiveEffect` types the data uses exist in `PassiveEffectType` and
+each has a real consumer, so no perk anywhere was silently doing nothing.
+
+`far_harad_halftroll` stays parked. It is commented out consistently across all three career files,
+which is the difference between deliberately absent and accidentally broken.
+
+New `CareerChoiceIntegrityTests` pins the cross-file references — declared `<Group id>`,
+`root_choice_id`, `ability_template_id`, and each group's `career_id` back-reference. Commented-out
+XML is invisible to `XDocument`, which is exactly right: a disabled block is as absent as a deleted
+one and both now fail the same way. All three assertions failed on `cave_troll_master` before the
+fix and on nothing else.
+
+### feat(careers): the last two selectable cultures with no careers at all
+
+Shaghâna and Âbanissa were 2 of 22 cultures a player can pick and the only two whose career stage
+offered nothing but "No specialization". They had sat in `CareerCultureCoverageTests`'
+`documentedExceptions` since Review #24 — the list written *because* of them, which then became the
+reason nobody noticed they were still there.
+
+Three careers each, cloned from Aserai on the evidence rather than on proximity: Shaghâna's own NPC
+file records that it "uses harad face templates and aserai civilian equipment", both cultures carry
+a `*DesertSpeedFeat`, and `VolunteerRecruitmentService` already routes Shaghâna volunteers to
+`harad_levy`. Named for their own towns in the live map — Tribesman of Zajâna, Chatâk Javelineer and
+Sormedân Beast Rider for Shaghâna; House-Guard of Damudûr, Jîret Javelineer and Ivory-Road Beast
+Rider for Âbanissa, whose notables are ivory, gold and gem traders rather than desert tribesmen.
+
+Inherited group names that say Haradwaith, Far Harad, Southrons, Scarlet or Mûmakan were left alone.
+Unlike the Ñoldor → Falathrim rename these words are already correct for a Harad culture, and
+Tolkien gives the Haradrim chieftain a black serpent upon scarlet, so Shaghâna keeps both.
+
+The clone tool's contamination gate only knew the word "Gundabad", which is fine until the source
+faction is not Gundabad. It now takes a `SOURCE_DISPLAY_WORDS` list covering Jelut, Pezarsan and
+Mahûd, so a missed remap fails the run instead of shipping Aserai wording under a Harad career.
+
+Both cultures removed from `documentedExceptions`, which is what makes the test start guarding them.
+The list is now empty.
+
+Verified: build 0 errors, `validate_moduledata.py` PASS, 514 career and culture-coverage tests
+green, and the audit re-run reports 67 careers all resolving 6 groups and 30 choices with no
+selectable culture left uncovered. Not proven: that any of it loaded — a new XML file is null
+in-engine until a full process restart, so the in-game smoke on Gundabad, Shaghâna and Âbanissa is
+still owed.
+
+Known gaps, unchanged by this work: 28 of 49 career portraits and all 49 ability icons have no PNG,
+and 974 of 3024 career localization keys are unregistered, so the 12 translated languages fall back
+to the inline English default.
+## 2026-08-11
+
+### fix(enlistment): seven field-test reports, six of them one root cause
+
+A live playtest produced seven separate complaints. Research against the installed v1.4.8 assemblies
+(and against ServeAsSoldier, decompiled with its PDB) showed six of them trace to a single deliberate
+TAOM decision: **`MobileParty.MainParty.Army` was kept permanently null**, because
+`ClearArmyAttachment()` runs in both `ParkNear` and `RestorePresence`.
+
+That one fact cascades. `PartyAgentOrigin.IsInSameArmyAsPlayer` is false, so `Mission.GetAgentTeam`
+routes the player to `PlayerTeam` and his commander's troops to `PlayerAllyTeam`;
+`DefaultBattleMissionAgentSpawnLogic` then lays out each team as its own deployment block with
+`PlayerTeam` sorted last and a 20-unit gap, which is the reported *"you start far behind all of the
+other units"*, exactly. `MapEvent.IsPlayerSergeant()` is structurally false for the same reason,
+which is why #424 had to strip the general role by hand, which in turn made vanilla's broken
+order-banner branch reachable.
+
+**The fix is a transient, battle-only army join** (`IArmyMembershipAdapter`): join the commander's
+army before `JoinBattle`, leave it at battle end. Verified clause by clause against the installed
+1.4.8 `IsInSameArmyAsPlayer`; it needs *both* `MainParty.Army == army` (which only the `Army` setter
+gives) *and* `MainParty.AttachedTo == army.LeaderParty` (which only `AddPartyToMergedParties` sets),
+so both calls are required and either alone leaves the player on his own team.
+
+**The leave is ordered above every other gate, and that ordering is the point.**
+`PlayerEncounter.FinishEncounterInternal` grants the post-defeat escape,
+`TeleportPartyToOutSideOfEncounterRadius()` plus `SetDoNotAttackMainParty(2)`, **only when
+`MainParty.AttachedTo == null`**, and `AddPartyToMergedParties` sets `AttachedTo`. A player still
+attached when the encounter finishes forfeits vanilla's escape and is re-engaged on the spot. That is
+the second half of report 7 (*"after they were defeated I immediately got jumped by the enemy
+army"*), and **ServeAsSoldier ships with exactly that hole**. A test pins the placement by failing
+when the detach is moved below the loot-flow gate.
+
+Where the commander has no army, one is created with the **bare `Army` constructor**, not
+`Kingdom.CreateArmy`: the latter calls `Gather()`, whose non-player branch runs
+`FindBestGatheringSettlementAndMoveTheLeader` and would send the commander marching to a fortification
+mid-battle as a side effect of a cosmetic team fix. The constructor alone is complete, the `Kingdom`
+setter self-registers via `AddArmyInternal`, and skips both the march and the "has formed an army"
+broadcast. No influence is charged: `OnAddPartyInternal`'s `ChangeClanInfluenceAction` branch is gated
+on `mobileParty != MainParty`.
+
+**The order banner is a vanilla bug**, verified verbatim at `BehaviorComponent.cs:107`:
+`new TextObject(ToString().Replace("MBModule.Behavior", ""))`. `BehaviorComponent` never overrides
+`ToString()`, so this is `object.ToString()` (the full type name) and the `.Replace` is dead code.
+The screenshot read `Men! TaleWorlds.MountAndBlade.BehaviorStop!` against the template
+`"Men! {BEHAVIOUR_NAME_BEGIN}!"`. The engine already ships the right call three methods away:
+`GetBehaviorString()` resolves `GetType().Name` against
+`str_formation_ai_sergeant_instruction_behavior_text`, which has **41 authored variations**,
+`BehaviorStop` is "Wait", `BehaviorCharge` is "Charge!". A one-instruction transpiler swaps the
+`ToString` call and leaves everything else vanilla; it self-bails if the pattern ever disappears.
+SAS does not fix this; it leaves the broken banner and adds its own on top.
+
+**Renown was structurally zero, not mistuned.** TAOM granted none, and vanilla's share scales with
+party contribution, an enlisted player is a party of one hero, so his share of a thousand-man
+engagement rounds away whatever he does. A small flat base plus the merit band's own figure now flows
+through the single `IServiceRewardService.Grant` chokepoint, via `GainRenownAction` rather than SAS's
+direct `Clan.AddRenown`, which bypasses `OnRenownGained` and every listener hung off it.
+
+**Both readings of the wage report were true.** `WagePolicy` pays only from commander gold above a
+500 reserve, so a poor lord's wage silently became arrears; and the gold that *did* arrive was
+transferred with `disableNotification: true` while the computed `DailySummary.Wage` was read by
+nobody. Payment, shortfall and forfeiture now each say so. Separately, the clan gold-change
+projection never knew the player had an income at all, a display-only line was added to
+`TaomClanFinanceModel`, excluded on the one call that passes `applyWithdrawals: true`
+(`ClanVariablesCampaignBehavior`, which is what actually moves the money) so nobody is paid twice.
+
+**Town entry** was not a placement bug: the player was already inside the settlement, and `"town"`,
+`"castle"` and `"village"` were simply in `RedirectMenuIds`. A shore-leave pass now suspends those
+three redirects while the column rests there, and dies the moment it moves. **We deliberately do not
+copy SAS here**; it force-evicts the player from every settlement each tick and substitutes a
+gear-picker conversation for shopping.
+
+**War declarations already happened, accidentally**: joining through the vanilla `encounter` menu
+runs `BeHostileAction.ApplyEncounterHostileAction`, which fires
+`DeclareWarAction.ApplyByPlayerHostility` against whoever the lord met. Those wars are now deliberate
+ (the commander's are mirrored at oath) and reversible, with **two fixes to SAS's version**: it
+peaces out of every war on discharge including ones the player brought with him (a free universal
+peace button), and its own changelog admits it ignores minor factions. The pre-oath enemy set is
+snapshotted before the first declaration lands, and only wars the mirror actually created are unwound.
+
+Also fixed: `FindCommanderPartyIdIn` matched only the commander's **own** party in `InvolvedParties`,
+so a commander attached to someone else's army was invisible to the primary join path, the reported
+*"my lord's army respawned, I was with the party but wasn't pulled into the fight"*, and the likely
+explanation for #408's 6-of-10 recovery ratio. It now matches the army leader too.
+
+Suite **6361 passed / 0 failed / 2 skipped** (6311 baseline, +50). `validate_moduledata` PASS,
+`lint_docs` clean. 5 new localization keys registered and seeded across all 12 languages;
+translation still owed (#434).
+
+Not-tested: the transpiler, the army merge and the diplomacy actions all need a live campaign.
+
+## 2026-08-10
+
+### feat(cultures): Blue Craig and Lindon were kingdoms without cultures, so they played as someone else
+
+Both shipped in June as real map factions, and both ran on a borrowed culture — `bluecraig` on
+`Culture.goblin`, `lindon` on `Culture.rivendell`. The faction map offered them, the culture
+confirmed, and then the player woke up somewhere else: the starting settlement is a property of the
+CULTURE, not of the region clicked, so picking Blue Craig started you in Goblin-town and picking
+Lindon started you in Rivendell rather than Mithlond. Everything downstream — troops, names, banner,
+feats, recruitment — was the host's too.
+
+Both now have their own `<Culture>` object and everything a culture needs: troop trees, 71 NPCs
+each, equipment sets, wanderers, the twelve canonical party templates, child/teen/lord/education
+templates, the six stage-2 tutor templates, enlistment rosters for all four ranks, a volunteer
+recruitment pool, cultural feats, CC narrative options in all four culture-scoped menus, CC starting
+equipment, starting denars, three careers each, and a body. Lindon is Círdan's Falathrim rather than
+a Rivendell reskin — Sindar shipwrights of the Grey Havens, not Imladris Ñoldor — and Blue Craig is
+the western goblin realm of the Ered Luin. The kingdoms, 7 clans, 50 lords and 25 settlements were
+retagged onto them, the last of those in the live `TAOM_Map` file outside git, with a `.bak-*` copy
+and `LANDLESS_CULTURE` as the in-repo gate that catches a module reinstall reverting it.
+
+Four defects surfaced during the work, each caught by a check that then became part of the tooling.
+A culture's id-space is not namespaced by its own name — `troops_rivendell.xml` defines 14
+`imladris_*` ids beside 13 `rivendell_*` ones — so a blanket rename produced a clone that redefined
+existing ids; the fix is an explicit id map. A display-text remap ending in `("rivendell", "lindon")`
+ran after the asset shield was lifted and renamed all 1763 `Item.rivendell_*` references out of
+existence: 2470 validator errors from a table entry that was merely redundant. The retag scoped
+"any element whose id matches" and matched the ROOT element, reporting 102 rewrites on `lords.xml` —
+Rivendell's 22 plus Goblin-town's 80, every lord of both host cultures. And a duplicate-id check
+collected into a `set`, which silently collapses an id minted twice by the same run, so seven
+duplicate party templates passed it; it counts a list now.
+
+Two more the surface audit caught after the data had landed: seven `kingdom_hero_party_*_*_N_template`
+duplicates, because the extractor matched any id merely CONTAINING the source name and swept up the
+per-clan family a different generator owns; and both cultures shipping with zero `<cultural_feats>`
+while their faction cards already advertised six bonuses each. Feat ids are now reused verbatim from
+the source, because `CulturalFeatsService` matches `FeatObject` identity against what
+`TaomCulturalFeats.cs` registers — a renamed `taom_lindon_*` feat resolves to nothing and is dropped
+without a word.
+
+Verified: build 0 errors, 6322 tests pass, `validate_moduledata.py --game-modules` PASS (40 cultures,
+5,317 NPCCharacters), doc lint clean, 0 encoding faults across 61 language files. The in-game smoke
+is still owed and is the only thing that proves any of it loaded — a new XML file is null in-engine
+until a full process restart. Method and traps:
+[`docs/features/culture-playability-wiring.md`](docs/features/culture-playability-wiring.md).
+
+### fix(character-creation): the two orc cultures were selectable, then handed the player nothing
+
+`goblin` and `mistymountainorcs` shipped CC-selectable in June. Picking either one worked right up to
+the moment character creation finalized, at which point three separate systems that give the player
+something had never heard of them, and none of the three said so.
+
+`equipmentsets/taom_char_creation_equipment.xml` covered twelve cultures and neither of these two, so
+all 24 roster ids those cultures can produce resolved to nothing. `PlayerEquipmentRosterIds` builds
+the id unconditionally — `player_char_creation_{culture}_{title}_{m|f}`, no existence check — and
+`PlayerEquipmentService` logs `RosterNotFound` and applies nothing, so the player walked out wearing
+whatever the previous stage happened to leave on them. `startup_resources_config.xml` had no row for
+either, and that file documents its own default as *"Default 0 (no warning when missing)"*, which
+makes an accidental omission byte-identical to a deliberate zero: they started on zero denars.
+Careers were parked in a `documentedExceptions` list, so the stage offered only "No specialization".
+
+Fixed all three. 110 rosters (55 per culture) generated from the item pool the shipped troop trees
+already use, so nothing references an item the Armory does not define; both cultures are marked
+`no_mount` because their troop trees contain zero `slot="Horse"` entries, and handing the player a
+horse the culture never fields is its own bug. Two `startup_resources_config.xml` rows sized against
+their nearest peers. Six careers cloned from Gundabad's three — the house pattern for these two
+cultures, whose troop trees and CC menus are already Gundabad clones.
+
+The clone script preserves `portrait_sprite`, `sprite`, `icon_sprite`, `particle_effect` and
+`sound_effect` verbatim rather than renaming them with everything else. The first run did rename
+them, which would have shipped six careers asking for particle systems and sounds nobody has
+authored. It also carries a contamination gate that fails the run if a source display word survives
+into a generated field — the defect the new-factions RCA recorded after it shipped.
+
+New `PlayerStartCoverageTests` pins both invariants, deriving the culture list from `cultures.json`
+rather than a hand-written list. That is the actual lesson: every one of these gaps reached a shipped
+build because the coverage table that should have caught it was written before the culture existed.
+Both cultures un-parked from the career exception list.
+
+Not fixed, found on the way: `tools/generate_char_creation_equipment.py` has drifted 257 lines from
+the file it owns — a full regeneration would revert Gondor's shield fix across 8 rosters — so it
+gained an `--append <culture>` mode instead. And Erebor's CC rosters still carry 16 horse-bearing
+entries despite `no-mount-cultures.md` recording their removal in March; the May regeneration put
+them back. Left alone as out of scope, recorded in
+[`docs/features/culture-playability-wiring.md`](docs/features/culture-playability-wiring.md), which
+is the new checklist for what a culture needs before it is playable rather than merely selectable.
+
+Verified: build 0 errors, 6322 tests pass, `validate_moduledata.py --game-modules` PASS. In-game
+smoke on a new campaign per culture is still owed — a new XML file is null in-engine until a full
+process restart, so none of the above proves the running game loaded it.
+
+### fix(advanced-combat): the warg-bite NRE was caught on every bite instead of prevented
+
+A warg battle under the debugger breaks on a `NullReferenceException` from a `[Lightweight Function]`
+frame inside `Mission.OnAgentHit`. It is not a crash — F5 continues and the battle plays on, because
+that frame **is** `Patch50_DropFlaggedItemGuard`: Harmony replaces a patched method's body with a
+`DynamicMethod`, which is what VS renders that way, and the patch's Finalizer swallows the NRE.
+
+The throw was never functionally destructive. `affectedAgent.CheckToDropFlaggedItem()` is
+`OnAgentHit`'s **last statement** (Mission.cs:5621, v1.4.8) — both `MissionBehavior` loops and the
+`AgentComponent.OnHit` loop have already run, and damage lands upstream in `HandleBlow`. What it cost
+was a throw plus stack unwind per bite inside `OnMissionTick`, and a debugger break on every warg
+engagement. So the fix is to stop generating the throw, not to keep catching it.
+
+Chasing it turned up something better than the tidy version. The patch's own doc comment attributed
+the NRE to a **mount** victim — a warg biting another warg — whose `Equipment[wieldedIndex].Item` was
+null. The live victim is not a mount: `IsHuman=true`, `IsMount=false`, `State=Active`, `Health=13`, no
+rider, no mount, flags carrying `CanWieldWeapon` — and **`Character == null`**. A null `Character`
+means a half-built or mid-teardown agent, one that never reached `InitializeMissionEquipment`, so
+`Equipment` itself is null and the **indexer** is the throw, not `.Item`. Vanilla's guard tests only
+the wielded index (`!= EquipmentIndex.None`) and never `Equipment` nor the resolved `Item`, so both
+shapes reach Agent.cs:3604.
+
+The new Prefix therefore guards the actual throw conditions rather than a proxy such as `IsMount`,
+which the second observation disproves. It checks `Equipment == null` first — which also avoids reads
+vanilla would do, since the wielded-index getters are unsafe raw pointer dereferences
+(`AgentHelper.GetPrimaryWieldedItemIndex`), making the skip strictly safer than vanilla rather than
+merely equivalent. The Finalizer stays: Harmony routes Prefix, original and postfix exceptions through
+it, so it still backstops shapes neither observation has shown. Decision logic sits in
+`DropFlaggedItemGuard`, unit-tested, because a patch body has no harness (ADR-008).
+
+Two things this is **not**. It is not v1.4.8 fallout — `Mission.OnAgentHit`, `Agent.HandleBlow` and
+`Agent.CheckToDropFlaggedItem` are byte-identical v1.4.5 → v1.4.8 and only line numbers moved. And two
+Watch-window results that looked like findings are debugger artifacts: `WalkingSpeedLimitOfMountable`
+throwing `AccessViolationException` and the wielded-index getters throwing `NullReferenceException` are
+both the evaluator failing on native calls and unsafe pointer dereferences, not runtime state.
+
+A reported adjacent defect was checked and **rejected rather than shipped**: `blow.VictimBodyPart` is
+indeed never assigned in `CustomAttacksUtils.TakeDamage`, and `BoneBodyPartType.Head` is 0, so the
+field does read as a headshot — but `Mission.RegisterBlow` takes `Blow` **by value** and its first
+statement is `b.VictimBodyPart = collisionData.VictimHitBodyPart`, which TAOM already sets to
+`Abdomen`. The engine normalises the field at the entry of the exact method TAOM calls, so no consumer
+ever sees the stale value. The "fix" would have been a no-op with a false changelog claim attached.
+
+Still open, and the more valuable question: why a half-built agent is in the bone-sweep target set at
+all. The Prefix makes the symptom moot but the target filters (`SpatialGrid`,
+`AgentAdapter.CustomAttack`, `HandleWargTargetHit`) all admit an agent that `IsActive()` reports as
+live before it is built — and that gap would affect spider, elephant and mûmakil identically.
+
+Not-tested: Harmony patch invocation (requires live game, ADR-008) — verify in-game by running a warg
+battle with `System.NullReferenceException` ticked in Exception Settings.
+Research: Mission.OnAgentHit, Mission.RegisterBlow, Agent.HandleBlow, Agent.CheckToDropFlaggedItem,
+AgentHelper, MissionEquipment, BoneBodyPartType, EquipmentIndex (installed v1.4.8)
+
+### feat(tools): a public build can drop 92.99 GB, and the engine settled the RDC question itself
+
+The editor's Publish Module step copies `RuntimeDataCache` into every module, and nobody could say
+whether players need it. The 2026-08-08 Procmon capture proved the shipping client *reads* it —
+13,795 `ReadFile` across 5,036 `.rdc` files — which killed the hoped-for "editor-only, delete it"
+answer. Two checks against the installed binaries take it the rest of the way.
+
+Diffing the RDC string surface between the client and editor builds of `TaleWorlds.Native.dll`: the
+client has `RuntimeDataCache`, `RDC0`, `RDC cache path is not valid` and the partial-read warning,
+and nothing else. Every write string — textures, meshes, animation clips, cloth cook data — is
+editor-only, including `External .rdc file modification detected. RDC files cannot be updated
+outside the editor.` The zero writes in that capture were not a warm cache; the client genuinely
+cannot rebuild what it reads. And vanilla `Modules\Native` ships 1,188 tpacs, 44.71 GB, and **zero**
+`.rdc` while running fine, on an identical TPAC v2 header. So the no-RDC path is retail's normal
+path and the only open number is what taking it costs.
+
+`tools/Invoke-RdcAbTest.ps1` makes that measurement one command — `-Status` / `-Off` / `-On` /
+`-Report`. It renames rather than deletes, refuses to run while the game is open, rolls back a
+partial toggle, and stamps every log artifact FRESH or STALE against a cutoff, because the first
+attempt at this capture produced zero rows for the sole reason that the game never ran. `-Report`
+pulled an RDC-ON baseline out of this morning's session: 67.4 s to `BattlePlayable` on
+`battle_terrain_biome_040`, 12,799 MB private at loading-done, 16,979 MB peak.
+
+`tools/package_release.py` is the packager the release process never had. It copies an allowed set
+into a fresh destination and never deletes from the source, so the editor install keeps the cache
+developers need. Dry run over the five release modules: **147.72 GB → 54.73 GB**, with zero
+unrecognised entries. Unknown paths are not merely logged — they fail the run until reviewed, since
+a new editor artifact riding along silently and a needed folder vanishing silently are the same bug.
+
+One exclusion did not survive the evidence: the audit doc listed `EmAssetPackages` as "editor-mode
+packs" worth 11.7 GB. Vanilla ships 26.36 GB of it. It is now a candidate that ships by default
+pending its own measurement, as is `Assets/Race Test`. The same check cleared `SceneEditData` and
+`SceneObj`, which vanilla also ships. Dropping RDC prints a standing warning naming the unrun A/B
+rather than letting a default harden into an assumption.
+
+Not-tested: 6,319 C# tests pass, 1 fails — `EveryBoolPrefix_HasACoopDisposition`, because another
+session's uncommitted work turned `Agent_CheckToDropFlaggedItem_Guard_Patch` into a `bool` prefix
+without classifying it. Not this change, and left alone. 542 Python tests green, 28 of them new.
+Research: `TaleWorlds.Native.dll` string surface, client vs editor build; `Modules\Native` tpac/rdc inventory.
+
+### test(release): the RDC A/B ran, and the first answer it gave was wrong
+
+Phase 1 went live with the cache renamed away on all four modules. The client booted, TAOM loaded and
+wrote its log, no `rgl_log_errors` file was produced at all — and the main menu came up **black**. The
+obvious reading was the one this repo's own `ui_loading` note predicts: a sprite whose manifest entry
+resolves while its texture does not, drawing textured-with-nothing, silently. That reading was wrong.
+The cause was stale compressed shader sacks, invalidated when Steam moved the install to v1.4.8 at
+07:22 the same morning; deleting them fixed the art with the cache still absent.
+
+Two variables had already been flagged — the missing cache, and a `TAOM.dll` built minutes earlier
+from another session's uncommitted prefix. Neither was the culprit. A third nobody had listed was.
+The lesson is not about RDC: an A/B whose environment changed that morning has more arms than the
+person running it thinks, and the honest move on a black screen is to enumerate what else moved
+that day before naming a cause.
+
+What is now settled, from the same session:
+
+- **The editor requires the cache.** Launched against the renamed folders it asserts on
+  `rglIntrusive_ptr.h:151`, `px != nullptr` — and it regenerated 6 `.rdc` files before dying, which
+  is the editor-only write surface demonstrating itself. Developers keep it; that was never in doubt
+  and is now measured.
+- **The shipping client reaches the main menu without it** and regenerates nothing, exactly as the
+  string evidence said it could not.
+
+What is **not** settled: the campaign map and a battle were never reached, and TAOM_Map is 13,577 of
+the 23,329 recorded operations against TAOM's 1,801. The menu exercised the small end. Load-time
+comparison against the 67.4 s baseline is also blocked until shaders are warm again, or the
+recompilation cost would be charged to the cache. The verdict stays open and the packager keeps
+printing its warning.
+
+Restoring afterwards found both a `RuntimeDataCache` and a `RuntimeDataCache.OFF` under TAOM. All six
+regenerated GUIDs already existed in the original 98, so nothing was lost; the partial was set aside
+rather than deleted. `package_release.py` now matches `RuntimeDataCache*` by prefix, so a stray
+`.OFF` or `.editor-partial-<date>` is excluded as cache instead of blocking a release run as unknown.
+
+### chore: v1.4.8 engine bump — nothing in `Main/` had to change
+
+Steam moved the installed game to v1.4.8 (War Sails v1.2.8, build `117131 → 119303`) at 07:22 this
+morning, alongside the public War Sails Modding Kit. The bump protocol ran end to end and came back
+cleaner than any before it: TAOM compiles against the new assemblies with **0 errors**,
+`BindingVerification` is **106/106**, the full suite is **6311 passed / 0 failed / 2 skipped**, and
+every data audit is green (action-set parity 0 gaps and 0 orphans, `validate_moduledata` PASS, all
+256 battle-map indices, mount parity clean).
+
+The strongest single statement available: regenerating the committed API snapshot against v1.4.8
+changed **only the version strings**. Not one of the 194 Harmony patch targets or 46 GameModel
+override signatures differs from the v1.4.7 copy.
+
+**8 of 56 shipping assemblies actually changed**, and three of those differ only by the build number.
+`TaleWorlds.MountAndBlade` — the combat assembly — changed by **one line**. Zero vanilla `ModuleData`
+XML was touched, which means the 1.4.7 data baseline survived the update and every parity audit still
+has something to compare against; that was luck, not design, since nothing archives vanilla data
+before Steam overwrites it.
+
+Diffing found four engine changes the changelog does not mention, all verified harmless to TAOM and
+all recorded in the impact doc: `Debug.ShowMessageBox` changed return type `void → int`; the
+raid-engagement guard narrowed to `engagingParty.IsMainParty`; two new save-repair blocks run on load
+(every existing TAOM save takes the village `MapEventSide` repair once); and `NotablesCampaignBehavior`
+now vetoes the death of a notable whose caravan is in a map event. That last one looked like a real
+hazard for culture conversion's notable replacement until the call chain resolved it —
+`ApplyByRemove` defaults `isForced: true`, which bypasses the veto. TAOM's **other** hero-kill path
+does not: `HeroAgeAdapter` → `ApplyByOldAge` passes four arguments, so `isForced` takes its `false`
+default and the veto applies. That one is harmless too, but for a different reason — `RaceAgeBehavior`
+re-enumerates every alive hero daily with no already-attempted set and announces only on a re-read of
+`IsAlive`, so a vetoed notable is retried tomorrow.
+
+Two things are owed and neither is code: the in-game control battles, and TAOM's ~158 MB of shader
+caches, which carry format version `0x0782` against the `0x0783` that all 486 sacks 1.4.8 shipped now
+use. Deferred deliberately, tracked as #448.
+
+Full analysis, including the changelog-item → surface → verdict table:
+[`docs/migration/v1.4.8-impact.md`](docs/migration/v1.4.8-impact.md).
+
+Research: NavigationCache · KillCharacterAction.ApplyByRemove · Scene.ClearRuntimeDecals · GauntletUI drag-drop
+Save-compat: none from TAOM — but 1.4.8 itself repairs village `MapEventSide` on any save older than v1.4.8
+Not-tested: in-game control battles, cold shader-precompile walk, first campaign load
+
+### fix(tools): the decompile stack was missing 34 assemblies, including ones we patch
+
+`decompile_bannerlord.ps1` only ever walked `<GameBin>\Win64_Shipping_{Client,wEditor}`, and
+`decompile_to_folder.ps1` pulled just the primary DLL per module. Everything shipping inside a
+module's own bin folder was in no decompile artifact at all — `SandBox.View`,
+`SandBox.ViewModelCollection`, `SandBox.GauntletUI`, `TaleWorlds.MountAndBlade.View`,
+`TaleWorlds.MountAndBlade.GauntletUI`, the `StoryMode` / `Multiplayer` / `NavalDLC` satellites.
+34 vanilla assemblies, and TAOM patches into several of them: `AgentVisuals`, `CharacterTableau`,
+`MobilePartyVisual`, `SPInventoryVM`, the tournament controllers.
+
+Nobody noticed because the gap is invisible until you try to diff. The v1.4.8 assembly comparison
+read as complete and was not — it covered the base bin only.
+
+The cost is one-way. Steam overwrites the install in place, so an assembly that is not in the stack
+when an update lands has no recoverable baseline afterwards; the 1.4.7 bytes for those 34 are gone.
+A `_modules_build` pass now decompiles all 125 managed module DLLs (`<Module>__<Dll>.cs`, because
+`TaleWorlds.MountAndBlade.Multiplayer.dll` ships in both `CustomBattle\` and `Multiplayer\` and a
+flat name would silently drop one). The next bump is diffable.
+
+For this bump the recovery came from `~/.taom-src/v1.4.7/`: 42 of its 475 cached types are from
+module DLLs, decompiled per-type from the 1.4.7 binaries by the same tool that reads 1.4.8. That set
+is exactly the module-DLL types TAOM has ever needed to look up.
+
+### fix(harness): the drift guard was silent on the exact event it exists to catch
+
+The `SessionStart` hook printed no `GAME VERSION DRIFT` banner this morning, with the game on v1.4.8
+and the pin on v1.4.7. Not a race — the session transcript's birth time is 08:20:07, 47 minutes after
+the update finished.
+
+`${BANNERLORD_GAME_DIR:-<literal>}` substitutes the literal only when the variable is unset or empty.
+A variable that is *set but does not resolve in the hook's environment* took the `-f` test straight to
+false and the entire block fell through without a word — and `settings.json` does not define
+`BANNERLORD_GAME_DIR`, so the hook inherits whatever the harness process happens to carry.
+
+It now tries the env path, then always falls back to the known install, and says
+`engine drift is UNCHECKED this session, not absent` when neither resolves. Still fail-open, no longer
+fail-silent: silence from this particular guard reads as "no drift" when it means "never checked", and
+that is how the 1.4.5→1.4.6 bump cost a morning of misattributed crashes.
+
 ## 2026-08-09
 
 ### fix(tools): the translator can be pointed at an install, and run without an Anthropic key
@@ -266,6 +1093,56 @@ design reviewers each caught that the redesign alone does not fix it.
 
 Known and accepted: a save made mid-duty under the old model may leave the spawned looter party on
 the map with nothing to destroy it. They are ordinary bandit parties the engine already manages.
+
+### fix(docs): 101 lines of writing were queued for silent deletion
+
+A doc-drift sweep found **51 lines of `enlistment.md`'s live-session record sitting inside its
+auto-generated backlinks region.** `build_backlinks.py`'s `splice_footer` keeps only
+`content[:start] + regenerated footer + content[end:]` — everything between the markers is discarded,
+with no error and no conflict. And the regeneration was already **armed**: today's handoff doc had
+become the file's 4th inbound reference while the footer still listed 3, so the next run would have
+taken it.
+
+Then it demonstrated itself. Running the generator during the fix destroyed **50 lines of
+`REVIEW-LOG.md`** — Review 84's entire record of the enlistment battle-join deep review — for exactly
+the same reason. Restored from `HEAD` and rescued properly. That is why this is now a linter check
+rather than a note in a doc nobody re-reads.
+
+**`lint_docs.py` check 3b:** authored prose between `backlinks-start` and `backlinks-end`. Two
+details make it correct rather than merely present:
+
+- It uses the generator's own **`rfind`** semantics, so it identifies the same region
+  `splice_footer` will rewrite. First-match semantics reported 11 findings; every one was a raw
+  Codex transcript that merely *quoted* a footer.
+- It skips `docs/reviews/raw/`. Those are gitignored verbatim tool dumps — nobody hand-writes prose
+  there to lose, and switching to `rfind` did not clear them because in a transcript the quoted pair
+  genuinely IS the last pair. The check is about authored docs.
+
+Verified RED (1 finding) and GREEN (0) against an injected line, and the real generator now runs
+over both rescued files without touching their prose.
+
+### docs: the rest of the drift sweep
+
+Six more corrections to `enlistment.md`, each one a claim the code had outgrown:
+
+- **The assignment-toast invariant row told a reader to restore the flood #436 removed.** It sits in
+  the "do not re-add travel" table, so it read as a rule.
+- **A dropped negation.** An edit turned "Nothing in the 2026-08-08 batch has run in a live game"
+  into "The rest of … has run in a live game" — self-refuting against the same doc's "Discharge, any
+  reason. Zero occurrences in the live log", since the MCM switch *is* a discharge.
+- **`EnlistedDetachedOnDuty` was described as "reserved for the content phase"** — it is retired, with
+  outbound edges only, and the table has **19** edges rather than the documented 20.
+- **"Detached-duty fights keep vanilla roles"** describes a case that cannot occur: `BattleCommandPolicy`
+  has no duty branch, and since #428 a duty never detaches the player. Same claim corrected in the
+  policy's own doc comment.
+- **A live "never anchor world spawns on the commander's settlement" trap row** for a code path that
+  was deleted — `SpawnLooterParty` survives only as a banned symbol in a test.
+- **The translation counts said 178 keys.** Recounted from the files by set comparison rather than by
+  count — a matching count with a differing key passes the weaker check — giving **225**, 12/12
+  id-identical.
+
+The one finding I did NOT act on: `CLAUDE.md:280` is 452 chars against a 400 cap. That row is the
+other session's uncommitted edit to the multi-session git-safety table, so it is theirs to trim.
 
 ### docs: bring the documentation back in line with a very long day
 

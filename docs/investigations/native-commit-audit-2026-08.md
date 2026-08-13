@@ -53,11 +53,11 @@ Two ledgers, never conflated:
 
 | Item | Size |
 |---|---|
-| `AssetSources/` across TAOM modules (editor-only per `docs/reference/worldmap-battle-scene-grid.md:203`) | **53.0 GB** |
-| `RuntimeDataCache/` across TAOM modules | **42.2 GB** |
-| `TAOM_Map/EmAssetPackages/` (editor-mode packs) | 12.0 GB |
-| `LOTRLOME_Armory/Assets/Race Test/` | 985.6 MB |
-| FactionMap orphan sprites in install | 545.7 MB |
+| `AssetSources/` across TAOM modules (editor-only per `docs/reference/worldmap-battle-scene-grid.md:203`) | **51.8 GB** (re-measured 2026-08-10, incl. `Alliance.Wargs`) |
+| `RuntimeDataCache/` across TAOM modules | **41.1 GB** (re-measured 2026-08-10, incl. `Alliance.Wargs`) |
+| ~~`TAOM_Map/EmAssetPackages/` (editor-mode packs)~~ | 11.7 GB — **NOT an exclusion candidate, see correction below** |
+| `LOTRLOME_Armory/Assets/Race Test/` | 987.8 MB |
+| ~~FactionMap orphan sprites in install~~ | **56.7 MB**, not 545.7 MB — the L3a cap (2026-08-08) already shrank this. The old number predates the fix; do not quote it |
 | Parked naval art (`TAOM_Map` ships/fishing-boat sources + geo tpacs) | ~185 MB |
 | `TAOM_Map/Prefabs_Unused/` | 54.8 MB |
 | `TAOM.NativeSkinFixes.pdb` ×3 + `.exp`/`.lib` (parked feature) | ~25 MB |
@@ -184,6 +184,95 @@ indistinguishable from "editor-only" on the RDC row count alone. **Always corrob
 appears in the capture** (or that a fresh `taom_debug_*.log` covers the window) before reading a zero
 as an answer. `tools/`-adjacent helper used for this run: `phase1-rdc.ps1` / `phase1-analyze.py`
 (session scratchpad; promote to `tools/` if Phase 1 is ever re-run).
+
+**Update — 2026-08-10. Two facts from the installed binaries narrow the question further, and one
+kills an exclusion candidate.**
+
+*(a) The client can never rebuild RDC — the engine says so.* Diffing the RDC string surface between
+`Win64_Shipping_Client\TaleWorlds.Native.dll` and `Win64_Shipping_wEditor\TaleWorlds.Native.dll`: the
+client carries only `RuntimeDataCache`, `RDC0`, `RDC cache path is not valid`, `rglAsset_package_link_wrdc`
+and the partial-read warning. **Every** write/generate string is editor-build-only — `Unable to write RDC
+of texture %s`, `…for mesh %s`, `…for animation clip %s`, `Unable to delete cloth cook data from RDC`,
+`Out of date RDC file found. RDC packing is disabled in test mode`, and the decisive one:
+
+> `External .rdc file modification detected. RDC files cannot be updated outside the editor. Please restart the game`
+
+So step 1.1's zero writes were not a warm-cache artifact, and the runbook's "does it regenerate?"
+observation row drops to a **falsification check**: if a folder ever does reappear, this string
+evidence is wrong and the verdict needs re-deriving. Corollary for release: ship without RDC and
+whatever the fallback path costs is paid on every load, forever.
+
+*(b) Vanilla is the control, and it ships none.* `Modules\Native` carries **1,188 tpacs / 44.71 GB and
+zero `.rdc`**, and retail runs. `Native\flora.tpac` and `TAOM_Map\pack0.tpac` share an identical TPAC v2
+header, so TAOM's editor-published packages are not a variant that hard-links to the cache. The no-RDC
+path is the *normal* retail path; what step 1.2 still has to measure is its cost, not its existence.
+
+*(c) Correction — `EmAssetPackages` is NOT editor-only, and was never evidence-checked.* The row above
+called it "editor-mode packs". **Vanilla `Modules\Native` ships 26.36 GB of `EmAssetPackages`**
+(measured 2026-08-10), which is not what an editor-only directory looks like. It is demoted from
+exclusion to *candidate*: it needs its own Procmon/A-B pass before anyone drops 11.7 GB of it.
+Same check cleared `SceneEditData` and `SceneObj` — vanilla ships both (Native: 0.19 GB / 1.1 GB),
+so they belong in a public build.
+
+**Tooling now exists for both halves** (2026-08-10):
+
+- `tools/Invoke-RdcAbTest.ps1` — `-Status` / `-Off` / `-On` / `-Report`. Renames only, never deletes,
+  refuses to run while Bannerlord is open, rolls back on partial failure, and `-Report` stamps every
+  log artifact FRESH or STALE against a `-SinceMinutes` cutoff so the method caveat above cannot
+  recur. It also extracts the four ON-vs-OFF comparison numbers directly.
+- `tools/package_release.py` — the L4 packager (see Phase 3).
+
+**RDC-ON baseline captured 2026-08-10** from `taom_debug_2026-08-10_10-23-55.log`, for the OFF run to
+be compared against: load to `BattlePlayable` **67.4 s** on scene `battle_terrain_biome_040`;
+`privMB` **12,799** at `FinishMissionLoadingDone`; peak `[MemSample]` `privMB` **16,979** over 78
+samples; `memLoad` 56 %. **The OFF run must use this same scene or the comparison is not like-for-like.**
+
+#### Step 1.2 — FIRST RUN, 2026-08-10. Partial. Verdict still OPEN.
+
+Cache renamed `.OFF` on TAOM, TAOM_Map, LOTRLOME_Armory, Alliance.Wargs (41.13 GB absent).
+
+| Observation | Result |
+|---|---|
+| Client boots to main menu | **yes** — TAOM loaded, `taom_debug_2026-08-10_13-23-05.log` written |
+| `rgl_log_errors_*.txt` | **never created** — zero engine errors logged |
+| Any `RuntimeDataCache` regenerated by the **client** | **no**, across every run |
+| Campaign map station | **NOT RUN** |
+| Battle station | **NOT RUN** |
+| Load-time / commit comparison | **VOID** (see shader caveat) |
+
+**Settled: the EDITOR requires RDC.** Launched against the renamed folders it asserts on
+`C:\BuildAgent\work\mb3\TaleWorlds.Shared\Source\Base\FairyTale.Library\rglIntrusive_ptr.h:151`,
+`Expression: px != nullptr`, and it regenerated **6 `.rdc` files into a fresh `RuntimeDataCache`
+before dying** — the editor-only write surface demonstrating itself. This is the exact
+"regeneration" event the falsification check was watching for, and it fired for the **editor**, never
+the client, which is what the string evidence predicted. Developers keep the cache; only the public
+build is in question.
+
+**The confound that nearly produced a wrong verdict.** With the cache off, the main menu rendered
+**black** — menu text and TAOM's font fine, module art gone, vanilla art fine, and *no log line*.
+That matches the `ui_loading` failure chain in Phase 3's L2 note exactly (manifest resolves, texture
+null, widget guards on the wrong thing), so it read as proof the client depends on RDC. **It was
+not.** The cause was **stale compressed shader sacks**, invalidated when Steam moved the install to
+v1.4.8 at **07:22 the same morning**; deleting them restored the art with the cache still absent.
+Two variables were already flagged (missing cache; a `TAOM.dll` built minutes earlier from another
+session's uncommitted `bool` prefix) and neither was it. **Rule for anyone re-running this: before
+attributing a rendering fault to RDC, enumerate everything that changed on the machine that day —
+an engine bump invalidates the shader cache, and that failure is silent too.**
+
+**Blocking the timing half:** the shader sacks were deleted, so the next loads pay full shader
+compilation. Comparing them to the 67.4 s baseline would charge that cost to RDC. Run
+*Pre-compile Shaders*, or let two launches settle, **then** measure.
+
+**Owed to close Phase 1:** campaign map (TAOM_Map is 13,577 of 23,329 ops — the menu only exercised
+TAOM's 1,801), a 250v250 on `battle_terrain_biome_040` with warm shaders, and the cloth/animation
+visual pass.
+
+**Restore note.** `-On` refused because TAOM held both a regenerated `RuntimeDataCache` and the
+`.OFF` original. All 6 regenerated GUIDs already existed among the original 98, so the partial was
+renamed to `RuntimeDataCache.editor-partial-2026-08-10` rather than deleted, and the originals were
+restored intact (98 / 2,817 / 4,061 / 166 files; 5.02 / 20.92 / 14.10 / 1.09 GB). `package_release.py`
+now matches `RuntimeDataCache*` by prefix so any stray variant is excluded as cache rather than
+blocking a release run as an unknown.
 
 ### Phase 2 — commit attribution matrix, ~2–3 h in-game on Mike's machine
 Configs {A vanilla-only · B TAOM-full · C TAOM+lever-under-test} × stations {menu 60 s · campaign map (fixed save)
@@ -342,7 +431,7 @@ is the named-mapped-files split, and it names the offending tpac/atlas *by file*
 > that displays it — verified in game, not by inspection.
 | L3b | FactionMap texture cache + dispose on CC exit | ~34 MB after L3a (was 0.3–1.2 GB) | The leak is real and verified — five `EngineTexture.LoadTextureFromPath` sites in `Main/Features/FactionMap/Widgets/`, and **zero** `Release`/`Dispose`/`Unload` calls anywhere in the feature, so every viewed faction stays resident for the process. L3a shrank the prize by ~97 %, so do this as correctness hygiene, not as a memory lever. `PolygonWidget`'s `_emblemSprite`/`_emblemLoaded` are **static** — reset them too or a second character creation in the same process draws from a released texture. |
 | L3c | `region_*` map art sizing (47 files, ~640 MB decoded) | unquantified | **Deliberately excluded from L3a.** `PolygonWidget.cs:323` sizes these as `ScaledSuggestedWidth = _bboxW * parentW` against a `StretchToParent` container, so they scale with the whole map surface rather than a fixed panel, and `region_map_boundary.png` covers the entire map. Capping them at 1024 would visibly soften the culture-stage map. Needs its own per-region rendered-size analysis first. |
-| L4 | Author `tools/package_release.ps1` (include-list; exclude RDC pending P1, AssetSources, Race Test, naval art, Prefabs_Unused, `.bak`, NSF pdbs) | install ≤ ~44 GB lighter | `.bak` exclusion changes the loaded XML set — gate with `validate_moduledata.py` + a load test |
+| **L4 — BUILT 2026-08-10** (`tools/package_release.py`, 27 unit tests) | Include-list packager: copies a dev install / publish output into a fresh destination, never deletes from source, so the editor keeps its RDC. Measured dry run over the 5-module release set: **147.72 GB → 54.73 GB, 92.99 GB dropped, 0 unrecognised entries.** Split: AssetSources 51.77 · RDC 41.12 · Prefabs_Unused 0.05 · NSF debug 0.03 · `.xml.bak` 0.01 · `.rtemp`/runtime-state ~0. | **92.99 GB** | Unknown top-level entries are reported and **fail the run** until `--allow-unknown` — so a new editor artifact cannot ride along silently and a needed folder cannot vanish silently. RDC exclusion prints a standing warning naming the unrun A/B; `--keep-rdc` is the pre-verdict safe default. `EmAssetPackages` (11.74 GB) and `Race Test` (0.96 GB) ship as **candidates** until proven. Still gate `.bak` with `validate_moduledata.py` + a load test of the packaged build. |
 | L5 | Delete 61 orphan install sprites + scoped deploy-prune step | install 546 MB | Prune scoped to TAOM-owned dirs only |
 | L6 | Action-set / skins rationalization | unknown (0.1–0.5 GB?) | ONLY after the Phase-2 menu delta isolates it; #385 says skin/morph data is hot |
 | L7 | TAOM_Map pack splitting (6 monolithic → many) | targets the 4 GB mapped ledger | High effort; VMMap decides first |
@@ -364,3 +453,14 @@ headroom). The remaining ~10–12 GB is battle content (armory textures are alre
 multiplier), engine working set, and .NET heaps; only content rationalization touches it, and only with Phase-2/4
 numbers in hand. The two measurements that most tighten this: one VMMap of TAOM-full mid-battle + the A-vs-B menu
 delta — under an hour combined.
+
+---
+
+<!-- backlinks-start auto-generated; edit lint_docs.py / build_backlinks.py to change -->
+
+## Referenced by
+
+- [docs/features/battle-load-diagnostics.md](../features/battle-load-diagnostics.md)
+- [docs/features/gui-sprite-system.md](../features/gui-sprite-system.md)
+
+<!-- backlinks-end -->

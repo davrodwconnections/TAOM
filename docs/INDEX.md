@@ -21,6 +21,7 @@
 ## By major system
 
 ### Character, race, body, & character creation
+- [culture-playability-wiring](features/culture-playability-wiring.md): the 14-row checklist separating a *selectable* culture from a *playable* one, why `is_main_culture` is not the CC gate (vanilla hardcodes six StringIds), and the three failure modes that ship silently: no CC equipment, no starting denars, no eligible career. Also the **party-template binding contract**: the eight engine-read attributes that decide which troops a culture actually spawns, why a `spcultures.xslt` block silently inherits Calradia for anything it never names, the caravan child elements that union rather than replace, and the two bindings that are unguarded crash surfaces rather than merely wrong troops
 - [character-creation](features/character-creation.md) — race-restricted CC dropdown, action_set requirements, narrative-stage flow, vanilla-aligned bonus budget (skill/attribute/focus per stage)
 - [character-creation-body-properties](features/character-creation-body-properties.md) — per-culture default body properties on CC screen (Patch29)
 - [character-selection](features/character-selection.md) — transpiler-driven race fallback in CC
@@ -30,6 +31,7 @@
 - [initial-child-generation](features/initial-child-generation.md) — campaign-start child rolls
 - [no-mount-cultures](features/no-mount-cultures.md) — suppress narrative horse crash on no-mount cultures (Patch20)
 - [native-skin-fixes](features/native-skin-fixes.md) — managed wrapper for `TAOM.NativeSkinFixes.dll` (covers_head morph + hair/beard cloth sim)
+- [kingdom-voices](features/kingdom-voices.md): per-race combat voice sets (barks, pain, death, formation shouts). Voice binds to **race, never culture**, so the Mannish kingdoms cannot be separated without C#; the three binding routes, the 68 voice types, and why TAOM's loose-`.wav` path needs no FMOD bank. Records the live race-to-voice table with its two standing defects: seven races bound to nothing, and three more diluted with vanilla entries so their shipped audio plays about one spawn in seven
 - [gui-sprite-system](features/gui-sprite-system.md) — sprite atlas conventions, verification before reference, the **decompile-verified sprite-bake pipeline** (no `pack0.tpac`; per-category `AssetSources` PNG + `Assets/_tex.tpac` + manifest) + end-to-end **Adding / Verifying a sprite** workflow (a new sprite needs the generator AND a render check — **baked ≠ visible**)
 
 ### Combat, AI, & battle
@@ -203,9 +205,10 @@ Other standards: [ADR-001 XML config](adrs/001-xml-config.md), [ADR-003 No `#reg
 - Historical prompt/review archives (pre-convention material, kept verbatim): [archive/README.md](archive/README.md).
 - External adoption reviews (one outside source folded into TAOM, distinct from RCAs): `reviews/adopt-<source>-<date>.md`. Current: [adopt-graphify](reviews/adopt-graphify-2026-06-08.md), [adopt-ponytail](reviews/adopt-ponytail-2026-06-18.md), [adopt-skillspector](reviews/adopt-skillspector-2026-06-22.md) (NVIDIA SkillSpector → 6 deterministic skill-threat categories + Python-AST + clean-room YARA in `tools/audit_claude_config.py`, plus the `--external` foreign-skill vet). Executable procedure: [ai-includes/external-repo-adoption.md](ai-includes/external-repo-adoption.md).
 
-## Migration history (v1.2 → v1.3 → v1.4.5)
+## Migration history (v1.2 → v1.3 → v1.4.x)
 
 - [migration/TRACKING.md](migration/TRACKING.md) — top-level migration audit trail
+- [migration/v1.4.8-impact.md](migration/v1.4.8-impact.md) — **current bump (2026-08-10).** v1.4.8 changelog → TAOM surface → verdict matrix, the engine changes the changelog doesn't mention, and what the bump left owed. Previous bump: [migration/v1.4.7-impact.md](migration/v1.4.7-impact.md), same document shape
 - [migration/v1.4.x-overview.md](migration/v1.4.x-overview.md) — current target migration plan
 - [migration/api-diff-1.3.15-to-1.4.5.md](migration/api-diff-1.3.15-to-1.4.5.md) — API delta table
 - [migration/XML-SCHEMA-CHANGES.md](migration/XML-SCHEMA-CHANGES.md) — XML schema changes between versions

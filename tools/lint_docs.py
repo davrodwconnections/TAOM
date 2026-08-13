@@ -6,6 +6,7 @@ Walks docs/ and reports doc rot:
 - Dead markdown links (relative paths that don't resolve)
 - Stale version refs (1.3.15, 1.3.x, Bannerlord 1.3 outside docs/migration/)
 - Orphan feature docs (docs/features/<x>.md not referenced anywhere else)
+- Prose trapped inside an auto-generated backlinks region (build_backlinks.py deletes it)
 - Missing feature docs (Main/Features/<X>/ without a matching docs/features/<x>.md)
 
 Usage:
@@ -21,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -222,11 +224,13 @@ class LintReport:
     dead_links: list[tuple[Path, int, str, str]] = field(default_factory=list)
     stale_versions: list[tuple[Path, int, str, str]] = field(default_factory=list)
     orphan_features: list[Path] = field(default_factory=list)
+    backlinks_prose: list[tuple[Path, int, str, str]] = field(default_factory=list)
     missing_feature_docs: list[tuple[str, str]] = field(default_factory=list)
     config_drift: list[tuple[Path, int, str, str]] = field(default_factory=list)
     version_mismatches: list[tuple[Path, int, str, str]] = field(default_factory=list)
     budget: list[tuple[Path, int, str, str]] = field(default_factory=list)
     model_registry: list[tuple[Path, int, str, str]] = field(default_factory=list)
+    dashes: list[tuple[Path, int, str, str]] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -234,11 +238,13 @@ class LintReport:
             len(self.dead_links)
             + len(self.stale_versions)
             + len(self.orphan_features)
+            + len(self.backlinks_prose)
             + len(self.missing_feature_docs)
             + len(self.config_drift)
             + len(self.version_mismatches)
             + len(self.budget)
             + len(self.model_registry)
+            + len(self.dashes)
         )
 
 
@@ -648,6 +654,66 @@ def build_inbound_reference_index(files: list[Path]) -> dict[Path, set[Path]]:
     return index
 
 
+def check_backlinks_region_prose(files: list[Path]) -> list[tuple[Path, int, str, str]]:
+    """Hand-written prose trapped inside the auto-generated backlinks region.
+
+    build_backlinks.py's splice_footer keeps only `content[:start] + footer + content[end:]`, so
+    ANYTHING between the markers is destroyed on its next run — silently, with no error and no
+    conflict. Found 2026-08-09 in docs/features/enlistment.md, which had 51 lines of a live-session
+    record sitting below the start marker with a regeneration already armed (the file had gained a
+    4th inbound reference while the footer still listed 3).
+
+    The region may legitimately contain only: blank lines, the `## Referenced by` heading, and the
+    generated `- [label](path)` list. Anything else is someone's writing about to be deleted.
+    """
+    findings: list[tuple[Path, int, str, str]] = []
+    start_re = re.compile(r"<!--\s*backlinks-start")
+    end_re = re.compile(r"<!--\s*backlinks-end")
+
+    for f in files:
+        # docs/reviews/raw/ is gitignored verbatim tool output (see is_never_committed_target).
+        # Nobody hand-writes prose there to lose, and the transcripts routinely QUOTE a backlinks
+        # footer — 11 false positives came from exactly that, and switching to the generator's
+        # rfind semantics did not clear them because the quoted pair IS the last pair in those
+        # files. The right answer is that this check is about authored docs.
+        if is_never_committed_target(f):
+            continue
+
+        try:
+            lines = f.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeDecodeError):
+            continue
+
+        # LAST marker pair, not the first — build_backlinks.py's splice_footer uses rfind for
+        # exactly this reason ("so footer-shaped examples inside fenced code blocks don't shadow
+        # the real footer"). The linter has to identify the SAME region the generator will
+        # rewrite, or it reports on text nothing is going to touch. First-match cost 11 false
+        # positives on raw Codex transcripts that merely quote a footer.
+        start = end = None
+        for i, line in enumerate(lines):
+            if start_re.search(line):
+                start = i
+        if start is not None:
+            for i in range(len(lines) - 1, start, -1):
+                if end_re.search(lines[i]):
+                    end = i
+                    break
+        if start is None or end is None:
+            continue
+
+        for i in range(start + 1, end):
+            stripped = lines[i].strip()
+            if not stripped:
+                continue
+            if stripped == "## Referenced by":
+                continue
+            if stripped.startswith("- [") and "](" in stripped:
+                continue
+            findings.append((f, i + 1, "backlinks-prose", stripped[:120]))
+
+    return findings
+
+
 def check_orphan_features(files: list[Path]) -> list[Path]:
     """Feature docs that no other doc references."""
     inbound = build_inbound_reference_index(files)
@@ -797,6 +863,131 @@ def check_model_registry() -> list[tuple[Path, int, str, str]]:
     return findings
 
 
+# --- AI-writing tell: em / en dashes in produced prose ----------------------
+# .claude/rules/output-style.md Part 2 bans U+2014 and U+2013 from prose Claude
+# produces (commits, CHANGELOG, issues, docs). Hyphens stay legal: `--RunTests`,
+# `v1.4.8` and `check-freeze.sh` are everywhere and matching them would make the
+# check unusable.
+#
+# Scope is NEW WRITING ONLY. 40,476 em dashes already sit in the tree (CHANGELOG
+# 1,604 / docs 37,448 / .claude 1,424, counted 2026-08-11) from the years the
+# house style kept them deliberately. A whole-tree check would report all of them
+# and be ignored within a day, so this one reads git: added lines vs a base ref,
+# plus untracked markdown in full.
+DASH_CHARS = {"—": "em-dash", "–": "en-dash"}
+_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+_INLINE_CODE_RE = re.compile(r"(`+).*?\1")
+_LINK_TARGET_RE = re.compile(r"\]\([^)]*\)")
+_BARE_URL_RE = re.compile(r"<?https?://\S+")
+# Escape hatch for text quoted verbatim from outside TAOM (a vanilla engine
+# string, an upstream README). Rewriting a quote to strip a dash falsifies it.
+_DASH_ALLOW_RE = re.compile(r"<!--\s*lint-allow-dash\s*-->")
+
+
+def scan_text_for_dashes(
+    path: Path, text: str, only_lines: set[int] | None = None
+) -> list[tuple[Path, int, str, str]]:
+    """Report em/en dashes in prose. only_lines=None scans the whole file.
+
+    Fence state is tracked across the WHOLE file even when only_lines restricts
+    what is reported, because an added line inside a code block is only
+    identifiable from the lines above it.
+    """
+    findings: list[tuple[Path, int, str, str]] = []
+    fence: str | None = None
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        opener = _FENCE_RE.match(raw)
+        if opener:
+            marker = opener.group(1)[0]
+            if fence is None:
+                fence = marker
+            elif marker == fence:
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        if only_lines is not None and lineno not in only_lines:
+            continue
+        if _DASH_ALLOW_RE.search(raw):
+            continue
+        line = _INLINE_CODE_RE.sub(" ", raw)
+        line = _LINK_TARGET_RE.sub(" ", line)
+        line = _BARE_URL_RE.sub(" ", line)
+        for ch, kind in DASH_CHARS.items():
+            if ch in line:
+                findings.append((path, lineno, kind, raw.strip()[:120]))
+                break  # one finding per line keeps the report readable
+    return findings
+
+
+def _git_out(*args: str) -> str | None:
+    """Run git in REPO_ROOT. Returns None on any failure (fail open)."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), *args],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+        )
+    except Exception:
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+_HUNK_RE = re.compile(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@")
+
+
+def _changed_markdown_lines(base: str) -> dict[Path, set[int] | None]:
+    """Added line numbers per markdown file. None means 'the whole file is new'."""
+    changed: dict[Path, set[int] | None] = {}
+    diff = _git_out("-c", "core.quotePath=false", "diff", "-U0", base, "--", "*.md")
+    if diff:
+        current: Path | None = None
+        prev = ""
+        for line in diff.splitlines():
+            # A `+++ b/path` header is always preceded by `--- a/path`. Checking
+            # that guards against an ADDED CONTENT line reading `++ foo`, which
+            # the `+` diff prefix turns into a convincing `+++ foo`.
+            if line.startswith("+++ ") and prev.startswith("--- "):
+                target = line[4:].strip()
+                if target == "/dev/null":
+                    current = None
+                else:
+                    current = REPO_ROOT / target[2:] if target.startswith("b/") else REPO_ROOT / target
+                    changed.setdefault(current, set())
+            elif line.startswith("diff --git "):
+                current = None
+            elif current is not None:
+                hunk = _HUNK_RE.match(line)
+                if hunk:
+                    start = int(hunk.group(1))
+                    count = 1 if hunk.group(2) is None else int(hunk.group(2))
+                    lines = changed[current]
+                    if lines is not None:
+                        lines.update(range(start, start + count))
+            prev = line
+    untracked = _git_out(
+        "-c", "core.quotePath=false", "ls-files", "--others", "--exclude-standard", "--", "*.md"
+    )
+    if untracked:
+        for name in untracked.splitlines():
+            name = name.strip()
+            if name:
+                changed[REPO_ROOT / name] = None
+    return changed
+
+
+def check_ai_dashes(base: str = "HEAD") -> list[tuple[Path, int, str, str]]:
+    findings: list[tuple[Path, int, str, str]] = []
+    for path, lines in sorted(_changed_markdown_lines(base).items(), key=lambda kv: str(kv[0])):
+        if not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+        except Exception:
+            continue
+        findings.extend(scan_text_for_dashes(path, text, lines))
+    return findings
+
+
 def rel(p: Path) -> str:
     try:
         return str(p.relative_to(REPO_ROOT)).replace("\\", "/")
@@ -812,11 +1003,13 @@ def format_report(report: LintReport, quick: bool) -> str:
     if not quick:
         out.append(f"- Stale version refs (outside migration/archive): **{len(report.stale_versions)}**")
         out.append(f"- Orphan feature docs (no inbound references): **{len(report.orphan_features)}**")
+        out.append(f"- Prose trapped in an auto-generated backlinks region: **{len(report.backlinks_prose)}**")
         out.append(f"- Missing feature docs (Main/Features/<X> with no docs/features/<x>.md): **{len(report.missing_feature_docs)}**")
         out.append(f"- Config-example drift (doc JSON != shipped ModuleData config): **{len(report.config_drift)}**")
         out.append(f"- Version mismatches (CLAUDE.md / snapshot != pin): **{len(report.version_mismatches)}**")
         out.append(f"- CLAUDE.md budget (size/row/line caps{'' if CLAUDE_MD_BUDGET_ENFORCE else ', warn-only'}): **{len(report.budget)}**")
         out.append(f"- GameModel registry drift (code vs the two catalogues): **{len(report.model_registry)}**")
+        out.append(f"- Em/en dashes in newly written prose: **{len(report.dashes)}**")
     out.append("")
     if report.dead_links:
         out.append("## Dead links")
@@ -833,6 +1026,16 @@ def format_report(report: LintReport, quick: bool) -> str:
             for f, lineno, label, line in report.stale_versions:
                 out.append(f"- `{rel(f)}:{lineno}` — `{label}` — `{line}`")
             out.append("")
+        if report.backlinks_prose:
+            out.append("## Prose trapped in an auto-generated backlinks region")
+            out.append("")
+            out.append("`build_backlinks.py` replaces EVERYTHING between the markers on its next "
+                       "run. These lines will be silently deleted — move them above the marker.")
+            out.append("")
+            for f, lineno, _kind, text in report.backlinks_prose:
+                out.append(f"- `{rel(f)}:{lineno}` — {text}")
+            out.append("")
+
         if report.orphan_features:
             out.append("## Orphan feature docs")
             out.append("")
@@ -890,6 +1093,18 @@ def format_report(report: LintReport, quick: bool) -> str:
                 loc = f"`{rel(f)}:{lineno}`" if lineno else f"`{rel(f)}`"
                 out.append(f"- {loc} — [{kind}] {msg}")
             out.append("")
+        if report.dashes:
+            out.append("## Em/en dashes in newly written prose")
+            out.append("")
+            out.append("An em or en dash is the loudest AI-writing tell, so produced prose does "
+                       "not use them (`.claude/rules/output-style.md` Part 2). Replace with a "
+                       "comma, a colon, a semicolon, parentheses, or a sentence break. Only NEW "
+                       "lines are reported; existing prose is left alone. Quoting an outside "
+                       "source verbatim? Mark the line `<!-- lint-allow-dash -->`.")
+            out.append("")
+            for f, lineno, kind, snippet in report.dashes:
+                out.append(f"- `{rel(f)}:{lineno}` — [{kind}] `{snippet}`")
+            out.append("")
     if report.total == 0:
         out.append("**Clean — no findings.**")
         out.append("")
@@ -910,6 +1125,9 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--fail-on-drift", action="store_true",
                     help="Exit 1 if any config-example drift OR version mismatch found (pre-commit gate)")
     ap.add_argument("--summary", action="store_true", help="Emit a --- delimited grep-friendly summary block instead of the full markdown report")
+    ap.add_argument("--dash-base", default="HEAD", metavar="REF",
+                    help="Base ref for the em/en dash check (default HEAD, i.e. uncommitted writing). "
+                         "Pass a branch point to scan a whole branch.")
     args = ap.parse_args(argv)
 
     files: list[Path] = []
@@ -922,11 +1140,13 @@ def main(argv: list[str]) -> int:
     if not args.quick:
         report.stale_versions = check_stale_versions(files)
         report.orphan_features = check_orphan_features(files)
+        report.backlinks_prose = check_backlinks_region_prose(files)
         report.missing_feature_docs = check_missing_feature_docs(feature_doc_basenames())
         report.config_drift = check_config_example_drift(files)
         report.version_mismatches = check_version_consistency()
         report.budget = check_claude_md_budget()
         report.model_registry = check_model_registry()
+        report.dashes = check_ai_dashes(args.dash_base)
 
     if args.summary:
         # Structured grep-friendly block, modeled on autoresearch's train.py final output
@@ -935,11 +1155,13 @@ def main(argv: list[str]) -> int:
             f"dead_links:        {len(report.dead_links)}",
             f"stale_versions:    {len(report.stale_versions)}",
             f"orphan_features:   {len(report.orphan_features)}",
+            f"backlinks_prose:   {len(report.backlinks_prose)}",
             f"missing_features:  {len(report.missing_feature_docs)}",
             f"config_drift:      {len(report.config_drift)}",
             f"version_mismatch:  {len(report.version_mismatches)}",
             f"claude_budget:     {len(report.budget)}",
             f"model_registry:    {len(report.model_registry)}",
+            f"ai_dashes:         {len(report.dashes)}",
             f"total_findings:    {report.total}",
             "---",
             "",
